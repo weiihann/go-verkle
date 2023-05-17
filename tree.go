@@ -335,24 +335,23 @@ func (n *InternalNode) Insert(key []byte, value []byte, resolver NodeResolverFn)
 
 func (n *InternalNode) InsertStem(stem []byte, values [][]byte, resolver NodeResolverFn) error {
 	nChild := offset2key(stem, n.depth) // index of the child pointed by the next byte in the key
-	n.cowChild(nChild)
 
 	switch child := n.children[nChild].(type) {
 	case UnknownNode:
 		return errMissingNodeInStateless
 	case Empty:
+		n.cowChild(nChild)
 		n.children[nChild] = NewLeafNode(stem, values)
 		n.children[nChild].setDepth(n.depth + 1)
 	case *HashedNode:
 		if resolver == nil {
 			return errInsertIntoHash
 		}
-		hash := child.commitment
-		serialized, err := resolver(hash)
+		serialized, err := resolver(stem[:n.depth+1])
 		if err != nil {
 			return fmt.Errorf("verkle tree: error resolving node %x at depth %d: %w", stem, n.depth, err)
 		}
-		resolved, err := ParseNode(serialized, n.depth+1, hash)
+		resolved, err := ParseNode(serialized, n.depth+1)
 		if err != nil {
 			return fmt.Errorf("verkle tree: error parsing resolved node %x: %w", stem, err)
 		}
@@ -361,6 +360,7 @@ func (n *InternalNode) InsertStem(stem []byte, values [][]byte, resolver NodeRes
 		// splits.
 		return n.InsertStem(stem, values, resolver)
 	case *LeafNode:
+		n.cowChild(nChild)
 		if equalPaths(child.stem, stem) {
 			return child.insertMultiple(stem, values)
 		}
@@ -387,8 +387,9 @@ func (n *InternalNode) InsertStem(stem []byte, values [][]byte, resolver NodeRes
 		newBranch.cowChild(nextWordInInsertedKey)
 		newBranch.children[nextWordInInsertedKey] = leaf
 	case *InternalNode:
+		n.cowChild(nChild)
 		return child.InsertStem(stem, values, resolver)
-	default: // It should be an UknonwnNode.
+	default: // It should be an UknownNode.
 		return errUnknownNodeType
 	}
 
@@ -480,12 +481,11 @@ func (n *InternalNode) GetStem(stem []byte, resolver NodeResolverFn) ([][]byte, 
 		if resolver == nil {
 			return nil, fmt.Errorf("hashed node %x at depth %d along stem %x could not be resolved: %w", child.Commitment().Bytes(), n.depth, stem, errReadFromInvalid)
 		}
-		hash := child.commitment
-		serialized, err := resolver(hash)
+		serialized, err := resolver(stem[:n.depth+1])
 		if err != nil {
 			return nil, fmt.Errorf("resolving node %x at depth %d: %w", stem, n.depth, err)
 		}
-		resolved, err := ParseNode(serialized, n.depth+1, hash)
+		resolved, err := ParseNode(serialized, n.depth+1)
 		if err != nil {
 			return nil, fmt.Errorf("verkle tree: error parsing resolved node %x: %w", stem, err)
 		}
@@ -522,13 +522,12 @@ func (n *InternalNode) Delete(key []byte, resolver NodeResolverFn) error {
 		if resolver == nil {
 			return errDeleteHash
 		}
-		comm := child.commitment
-		payload, err := resolver(comm)
+		payload, err := resolver(key[:n.depth+1])
 		if err != nil {
 			return err
 		}
 		// deserialize the payload and set it as the child
-		c, err := ParseNode(payload, n.depth+1, comm)
+		c, err := ParseNode(payload, n.depth+1)
 		if err != nil {
 			return err
 		}

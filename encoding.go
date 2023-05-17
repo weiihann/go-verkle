@@ -68,7 +68,7 @@ var errSerializedPayloadTooShort = errors.New("verkle payload is too short")
 // The serialized bytes have the format:
 // - Internal nodes: <nodeType><bitlist><children...>
 // - Leaf nodes:     <nodeType><stem><bitlist><c1comm><c2comm><children...>
-func ParseNode(serializedNode []byte, depth byte, comm SerializedPointCompressed) (VerkleNode, error) {
+func ParseNode(serializedNode []byte, depth byte) (VerkleNode, error) {
 	// Check that the length of the serialized node is at least the smallest possible serialized node.
 	if len(serializedNode) < nodeTypeSize+bitlistSize {
 		return nil, errSerializedPayloadTooShort
@@ -76,17 +76,17 @@ func ParseNode(serializedNode []byte, depth byte, comm SerializedPointCompressed
 
 	switch serializedNode[0] {
 	case leafRLPType:
-		return parseLeafNode(serializedNode, depth, comm)
+		return parseLeafNode(serializedNode, depth)
 	case internalRLPType:
 		bitlist := serializedNode[internalBitlistOffset : internalBitlistOffset+bitlistSize]
 		children := serializedNode[internalNodeChildrenOffset:]
-		return CreateInternalNode(bitlist, children, depth, comm)
+		return CreateInternalNode(bitlist, children, depth)
 	default:
 		return nil, ErrInvalidNodeEncoding
 	}
 }
 
-func parseLeafNode(serialized []byte, depth byte, comm SerializedPointCompressed) (VerkleNode, error) {
+func parseLeafNode(serialized []byte, depth byte) (VerkleNode, error) {
 	bitlist := serialized[leafBitlistOffset : leafBitlistOffset+bitlistSize]
 	var values [NodeWidth][]byte
 	offset := leafChildrenOffset
@@ -110,7 +110,7 @@ func parseLeafNode(serialized []byte, depth byte, comm SerializedPointCompressed
 	return ln, nil
 }
 
-func CreateInternalNode(bitlist []byte, raw []byte, depth byte, comm SerializedPointCompressed) (*InternalNode, error) {
+func CreateInternalNode(bitlist []byte, raw []byte, depth byte) (*InternalNode, error) {
 	// GetTreeConfig caches computation result, hence
 	// this op has low overhead
 	n := (newInternalNode(depth)).(*InternalNode)
