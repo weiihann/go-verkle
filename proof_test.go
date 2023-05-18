@@ -622,6 +622,19 @@ func TestProofVerificationThreeStemsInSameExtensionStatus(t *testing.T) {
 	testSerializeDeserializeProof(t, insertKVs, proveKeys)
 }
 
+func TestProofVerificationTwoLeavesWithDifferentValues(t *testing.T) {
+	key1, _ := hex.DecodeString("0000000000000000000000000000000000000000000000000000000000000000")
+	key2, _ := hex.DecodeString("0100000000000000000000000000000000000000000000000000000000000000")
+
+	insertKVs := map[string][]byte{
+		string(key1): fourtyKeyTest,
+		string(key2): forkOneKeyTest,
+	}
+	proveKeys := keylist{key1, key2}
+
+	testSerializeDeserializeProof(t, insertKVs, proveKeys)
+}
+
 func testSerializeDeserializeProof(t *testing.T, insertKVs map[string][]byte, proveKeys keylist) {
 	root := New()
 
