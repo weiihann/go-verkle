@@ -576,19 +576,19 @@ func TestNodeSerde(t *testing.T) {
 	// Now deserialize and re-construct tree
 	res, err := ParseNode(ls0, 1)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	resLeaf0 := res.(*LeafNode)
 
 	res, err = ParseNode(ls64, 1)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	resLeaf64 := res.(*LeafNode)
 
 	res, err = ParseNode(rs, 0)
 	if err != nil {
-		t.Error(err)
+		t.Fatal(err)
 	}
 	resRoot := res.(*InternalNode)
 
@@ -596,7 +596,7 @@ func TestNodeSerde(t *testing.T) {
 	resRoot.children[64] = resLeaf64
 
 	if !isInternalEqual(root, resRoot) {
-		t.Errorf("parsed node not equal, %x != %x", root.commitment.Bytes(), resRoot.commitment.Bytes())
+		t.Fatalf("parsed node not equal, %x != %x", root.commitment.Bytes(), resRoot.commitment.Bytes())
 	}
 
 	if resRoot.Commitment().Bytes() != origComm {
