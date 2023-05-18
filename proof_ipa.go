@@ -79,6 +79,7 @@ func GetCommitmentsForMultiproof(root VerkleNode, keys [][]byte) (*ProofElements
 	return root.GetProofItems(keylist(keys))
 }
 
+// QUESTION(jsign): do we need this `keys` and `keyvals` separation? Shouldn't keys == keys(keyvals)?
 func MakeVerkleMultiProof(root VerkleNode, keys [][]byte, keyvals map[string][]byte) (*Proof, []*Point, []byte, []*Fr, error) {
 	// go-ipa won't accept no key as an input, catch this corner case
 	// and return an empty result.
@@ -353,6 +354,7 @@ func TreeFromProof(proof *Proof, rootC *Point) (VerkleNode, error) {
 				continue
 			}
 
+			// TODO(jsign): this if will never be true.
 			if bytes.Equal(k, info[string(p)].stem) {
 				values[k[31]] = proof.Values[i]
 			}

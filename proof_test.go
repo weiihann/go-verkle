@@ -578,9 +578,9 @@ func TestStatelessDeserialize(t *testing.T) {
 		string(fourtyKeyTest): fourtyKeyTest,
 		string(ffx32KeyTest):  fourtyKeyTest,
 	}
-	proveKVs := keylist{zeroKeyTest, fourtyKeyTest}
+	proveKeys := keylist{zeroKeyTest, fourtyKeyTest}
 
-	testSerializeDeserializeProof(t, insertKVs, proveKVs)
+	testSerializeDeserializeProof(t, insertKVs, proveKeys)
 }
 
 func TestStatelessDeserializeMissingChildNode(t *testing.T) {
@@ -589,9 +589,9 @@ func TestStatelessDeserializeMissingChildNode(t *testing.T) {
 		string(oneKeyTest):   fourtyKeyTest,
 		string(ffx32KeyTest): fourtyKeyTest,
 	}
-	proveKVs := keylist{zeroKeyTest, fourtyKeyTest}
+	proveKeys := keylist{zeroKeyTest, fourtyKeyTest}
 
-	testSerializeDeserializeProof(t, insertKVs, proveKVs)
+	testSerializeDeserializeProof(t, insertKVs, proveKeys)
 }
 
 func TestStatelessDeserializeDepth2(t *testing.T) {
@@ -601,23 +601,25 @@ func TestStatelessDeserializeDepth2(t *testing.T) {
 		string(key1):         fourtyKeyTest,
 		string(ffx32KeyTest): fourtyKeyTest,
 	}
-	proveKVs := keylist{zeroKeyTest, key1}
+	proveKeys := keylist{zeroKeyTest, key1}
 
-	testSerializeDeserializeProof(t, insertKVs, proveKVs)
+	testSerializeDeserializeProof(t, insertKVs, proveKeys)
 }
 
-func TestProofVerificationCoherency(t *testing.T) {
-	testCases := []struct {
-		name      string
-		insertKVs map[string][]byte
-		proveKVs  keylist
-	}{}
+func TestProofVerificationThreeStemsInSameExtensionStatus(t *testing.T) {
+	key1_0, _ := hex.DecodeString("0000000000000000000000000000000000000000000000000000000000000000")
+	key2_0, _ := hex.DecodeString("0002000000000000000000000000000000000000000000000000000000000000")
+	key3_0, _ := hex.DecodeString("0003000000000000000000000000000000000000000000000000000000000000")
+	key3_1, _ := hex.DecodeString("0003000000000000000000000000000000000000000000000000000000000001")
+	key4_0, _ := hex.DecodeString("0004000000000000000000000000000000000000000000000000000000000000")
 
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			testSerializeDeserializeProof(t, testCase.insertKVs, testCase.proveKVs)
-		})
+	insertKVs := map[string][]byte{
+		string(key3_0): fourtyKeyTest,
+		string(key3_1): fourtyKeyTest,
 	}
+	proveKeys := keylist{key1_0, key2_0, key3_0, key3_1, key4_0}
+
+	testSerializeDeserializeProof(t, insertKVs, proveKeys)
 }
 
 func testSerializeDeserializeProof(t *testing.T, insertKVs map[string][]byte, proveKeys keylist) {
@@ -658,18 +660,28 @@ func testSerializeDeserializeProof(t *testing.T, insertKVs map[string][]byte, pr
 	}
 
 	// For each proving key-value, each branch in the original and reconstructed tree nodes
-	// should match their commitments.
+	// should match their commitments and values.
 	for _, key := range proveKeys {
 		originalPath := getKeyFullPath(root, key)
 		reconstructedPath := getKeyFullPath(droot, key)
 
+		// Original and reconstructed path lengths must match.
 		if len(originalPath) != len(reconstructedPath) {
 			t.Fatalf("key %x: original path has %d nodes, reconstructed path has %d nodes", key, len(originalPath), len(reconstructedPath))
 		}
 
+		// Each node commitment in the original and reconstructed path must match.
 		for i := range originalPath {
 			if !Equal(originalPath[i].Commit(), reconstructedPath[i].Commit()) {
 				t.Fatalf("key %x: node %d: original path node commitment %x, reconstructed path node commitment %x", key, i, originalPath[i].Commit(), reconstructedPath[i].Commit())
+			}
+		}
+
+		// If this proved key isn't absent, check that the last element is a leaf node, and that the value matches.
+		if value, ok := proveKVs[string(key)]; ok {
+			reconstructedLeafNode := reconstructedPath[len(reconstructedPath)-1].(*LeafNode)
+			if !bytes.Equal(reconstructedLeafNode.values[key[31]], value) {
+				t.Fatalf("value for key %x does not match", key)
 			}
 		}
 

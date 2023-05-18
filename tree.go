@@ -400,6 +400,7 @@ func (n *InternalNode) InsertStem(stem []byte, values [][]byte, resolver NodeRes
 // commitments that have not been assigned a node. It returns
 // the same list, save the commitments that were consumed
 // during this call.
+// TODO(jsign): what is this `values` parameter?
 func (n *InternalNode) CreatePath(path []byte, stemInfo stemInfo, comms []*Point, values [][]byte) ([]*Point, error) {
 	if len(path) == 0 {
 		return comms, errors.New("invalid path")
