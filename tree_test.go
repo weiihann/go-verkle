@@ -561,35 +561,32 @@ func TestNodeSerde(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	l0c := leaf0.commitment.Bytes()
 
 	leaf64 := (root.children[64]).(*LeafNode)
 	ls64, err := leaf64.Serialize()
 	if err != nil {
 		t.Error(err)
 	}
-	l64c := leaf64.commitment.Bytes()
 
 	rs, err := root.Serialize()
 	if err != nil {
 		t.Error(err)
 	}
-	rc := root.commitment.Bytes()
 
 	// Now deserialize and re-construct tree
-	res, err := ParseNode(ls0, 1, l0c[:])
+	res, err := ParseNode(ls0, 1)
 	if err != nil {
 		t.Error(err)
 	}
 	resLeaf0 := res.(*LeafNode)
 
-	res, err = ParseNode(ls64, 1, l64c[:])
+	res, err = ParseNode(ls64, 1)
 	if err != nil {
 		t.Error(err)
 	}
 	resLeaf64 := res.(*LeafNode)
 
-	res, err = ParseNode(rs, 0, rc[:])
+	res, err = ParseNode(rs, 0)
 	if err != nil {
 		t.Error(err)
 	}

@@ -50,7 +50,8 @@ const (
 	// Leaf node offsets.
 	leafSteamOffset        = nodeTypeOffset + nodeTypeSize
 	leafBitlistOffset      = leafSteamOffset + StemSize
-	leafC1CommitmentOffset = leafBitlistOffset + bitlistSize
+	leafCommitmentOffset   = leafBitlistOffset + bitlistSize
+	leafC1CommitmentOffset = leafCommitmentOffset + SerializedPointCompressedSize
 	leafC2CommitmentOffset = leafC1CommitmentOffset + SerializedPointCompressedSize
 	leafChildrenOffset     = leafC2CommitmentOffset + SerializedPointCompressedSize
 )
@@ -78,9 +79,7 @@ func ParseNode(serializedNode []byte, depth byte) (VerkleNode, error) {
 	case leafRLPType:
 		return parseLeafNode(serializedNode, depth)
 	case internalRLPType:
-		bitlist := serializedNode[internalBitlistOffset : internalBitlistOffset+bitlistSize]
-		children := serializedNode[internalNodeChildrenOffset:]
-		return CreateInternalNode(bitlist, children, depth)
+		return CreateInternalNode(serializedNode[internalNodeChildrenOffset:], depth)
 	default:
 		return nil, ErrInvalidNodeEncoding
 	}
@@ -106,42 +105,20 @@ func parseLeafNode(serialized []byte, depth byte) (VerkleNode, error) {
 	ln.c2 = new(Point)
 	ln.c2.SetBytesTrusted(serialized[leafC2CommitmentOffset : leafC2CommitmentOffset+SerializedPointCompressedSize])
 	ln.commitment = new(Point)
-	ln.commitment.SetBytesTrusted(comm)
+	ln.commitment.SetBytesTrusted(serialized[leafCommitmentOffset:leafC1CommitmentOffset])
 	return ln, nil
 }
 
-func CreateInternalNode(bitlist []byte, raw []byte, depth byte) (*InternalNode, error) {
+func CreateInternalNode(raw []byte, depth byte) (*InternalNode, error) {
 	// GetTreeConfig caches computation result, hence
 	// this op has low overhead
 	n := (newInternalNode(depth)).(*InternalNode)
-	indices := indicesFromBitlist(bitlist)
 
-	if len(raw)/SerializedPointCompressedSize != len(indices) {
+	if len(raw) != SerializedPointCompressedSize {
 		return nil, ErrInvalidNodeEncoding
 	}
 
-	freelist := make([]HashedNode, len(indices))
-	for i, index := range indices {
-		freelist[i].commitment = raw[i*SerializedPointCompressedSize : (i+1)*SerializedPointCompressedSize]
-		n.children[index] = &freelist[i]
-	}
 	n.commitment = new(Point)
-	n.commitment.SetBytesTrusted(comm)
+	n.commitment.SetBytesTrusted(raw)
 	return n, nil
-}
-
-func indicesFromBitlist(bitlist []byte) []int {
-	indices := make([]int, 0, 32)
-	for i, b := range bitlist {
-		if b == 0 {
-			continue
-		}
-		// the bitmap is little-endian, inside a big-endian byte list
-		for j := 0; j < 8; j++ {
-			if b&mask[j] != 0 {
-				indices = append(indices, i*8+j)
-			}
-		}
-	}
-	return indices
 }

@@ -3,7 +3,7 @@ package verkle
 import "testing"
 
 func TestParseNodeEmptyPayload(t *testing.T) {
-	_, err := ParseNode([]byte{}, 0, SerializedPointCompressed{})
+	_, err := ParseNode([]byte{}, 0)
 	if err != errSerializedPayloadTooShort {
 		t.Fatalf("invalid error, got %v, expected %v", err, "unexpected EOF")
 	}
@@ -25,7 +25,7 @@ func TestLeafStemLength(t *testing.T) {
 
 func TestInvalidNodeEncoding(t *testing.T) {
 	// Test a short payload.
-	if _, err := ParseNode([]byte{leafRLPType}, 0, SerializedPointCompressed{}); err != errSerializedPayloadTooShort {
+	if _, err := ParseNode([]byte{leafRLPType}, 0); err != errSerializedPayloadTooShort {
 		t.Fatalf("invalid error, got %v, expected %v", err, errSerializedPayloadTooShort)
 	}
 
@@ -38,7 +38,7 @@ func TestInvalidNodeEncoding(t *testing.T) {
 		t.Fatalf("serializing leaf node: %v", err)
 	}
 	lnbytes[0] = leafRLPType + internalRLPType // Change the type of the node to something invalid.
-	if _, err := ParseNode(lnbytes, 0, SerializedPointCompressed{}); err != ErrInvalidNodeEncoding {
+	if _, err := ParseNode(lnbytes, 0); err != ErrInvalidNodeEncoding {
 		t.Fatalf("invalid error, got %v, expected %v", err, ErrInvalidNodeEncoding)
 	}
 }
