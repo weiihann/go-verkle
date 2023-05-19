@@ -1484,7 +1484,7 @@ func (n *LeafNode) serializeWithCompressedCommitments(cBytes, c1Bytes, c2Bytes [
 	}
 
 	// Create the serialization.
-	baseSize := nodeTypeSize + StemSize + bitlistSize + 2*SerializedPointCompressedSize
+	baseSize := nodeTypeSize + StemSize + bitlistSize + 3*SerializedPointCompressedSize
 	result := make([]byte, baseSize, baseSize+4*32) // Extra pre-allocated capacity for 4 values.
 	result[0] = leafRLPType
 	copy(result[leafSteamOffset:], n.stem[:StemSize])
