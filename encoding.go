@@ -56,6 +56,16 @@ const (
 	leafC1CommitmentOffset = leafCommitmentOffset + banderwagon.UncompressedSize
 	leafC2CommitmentOffset = leafC1CommitmentOffset + banderwagon.UncompressedSize
 	leafChildrenOffset     = leafC2CommitmentOffset + banderwagon.UncompressedSize
+
+	// Expiry Leaf node offsets.
+	expiryLeafSteamOffset        = nodeTypeOffset + nodeTypeSize
+	expiryLeafBitlistOffset      = expiryLeafSteamOffset + StemSize
+	expiryLeafCommitmentOffset   = expiryLeafBitlistOffset + bitlistSize
+	expiryLeafC1CommitmentOffset = expiryLeafCommitmentOffset + banderwagon.UncompressedSize
+	expiryLeafC2CommitmentOffset = expiryLeafC1CommitmentOffset + banderwagon.UncompressedSize
+	expiryLeafC3CommitmentOffset = expiryLeafC2CommitmentOffset + banderwagon.UncompressedSize
+	expiryLeafChildrenOffset     = expiryLeafC3CommitmentOffset + banderwagon.UncompressedSize
+	expiryLeafEpochOffset        = expiryLeafChildrenOffset + banderwagon.UncompressedSize
 )
 
 func bit(bitlist []byte, nr int) bool {

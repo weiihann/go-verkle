@@ -102,7 +102,7 @@ type ProofElements struct {
 	Fis    [][]Fr
 	ByPath map[string]*Point // Gather commitments by path
 	Vals   [][]byte          // list of values read from the tree
-
+	Epochs []StateEpoch      // list of epochs read from the tree
 	// dedups flags the presence of each (Ci,zi) tuple
 	dedups map[*Point]map[byte]struct{}
 }
@@ -156,8 +156,9 @@ func (pe *ProofElements) Merge(other *ProofElements) {
 const (
 	// These types will distinguish internal
 	// and leaf nodes when decoding from RLP.
-	internalRLPType byte = 1
-	leafRLPType     byte = 2
+	internalRLPType   byte = 1
+	leafRLPType       byte = 2
+	expiryLeafRLPType byte = 3
 )
 
 type (
@@ -183,6 +184,17 @@ type (
 		c1, c2     *Point
 
 		depth byte
+	}
+	ExpiryLeafNode struct {
+		stem   []byte
+		values [][]byte
+		epochs []StateEpoch
+
+		commitment *Point
+		c1, c2, c3 *Point
+
+		depth     byte
+		currEpoch StateEpoch
 	}
 )
 
@@ -304,6 +316,80 @@ func NewLeafNode(stem []byte, values [][]byte) (*LeafNode, error) {
 	}, nil
 }
 
+// New creates a new leaf node
+func NewExpiryLeafNode(stem []byte, values [][]byte, currEpoch StateEpoch) (*ExpiryLeafNode, error) {
+	cfg := GetConfig()
+
+	// C1.
+	var c1poly [NodeWidth]Fr
+	var c1 *Point
+	count, err := fillSuffixTreePoly(c1poly[:], values[:NodeWidth/2])
+	if err != nil {
+		return nil, err
+	}
+	containsEmptyCodeHash := len(c1poly) >= EmptyCodeHashSecondHalfIdx &&
+		c1poly[EmptyCodeHashFirstHalfIdx].Equal(&EmptyCodeHashFirstHalfValue) &&
+		c1poly[EmptyCodeHashSecondHalfIdx].Equal(&EmptyCodeHashSecondHalfValue)
+	if containsEmptyCodeHash {
+		// Clear out values of the cached point.
+		c1poly[EmptyCodeHashFirstHalfIdx] = FrZero
+		c1poly[EmptyCodeHashSecondHalfIdx] = FrZero
+		// Calculate the remaining part of c1 and add to the base value.
+		partialc1 := cfg.CommitToPoly(c1poly[:], NodeWidth-count-2)
+		c1 = new(Point)
+		c1.Add(&EmptyCodeHashPoint, partialc1)
+	} else {
+		c1 = cfg.CommitToPoly(c1poly[:], NodeWidth-count)
+	}
+
+	// C2.
+	var c2poly [NodeWidth]Fr
+	count, err = fillSuffixTreePoly(c2poly[:], values[NodeWidth/2:])
+	if err != nil {
+		return nil, err
+	}
+	c2 := cfg.CommitToPoly(c2poly[:], NodeWidth-count)
+
+	// C3.
+	var c3poly [NodeWidth]Fr
+	var epochs [NodeWidth]StateEpoch
+	// fill up the epochs
+	for i := 0; i < NodeWidth; i++ {
+		if values[i] != nil {
+			epochs[i] = currEpoch
+		} else {
+			epochs[i] = 0
+		}
+	}
+	err = fillStateEpochPoly(c3poly[:], values[:], epochs[:])
+	if err != nil {
+		return nil, err
+	}
+	c3 := cfg.CommitToPoly(c3poly[:], NodeWidth-count)
+
+	// Root commitment preparation for calculation.
+	stem = stem[:StemSize] // enforce a 31-byte length
+	var poly [NodeWidth]Fr
+	poly[0].SetUint64(1)
+	if err := StemFromBytes(&poly[1], stem); err != nil {
+		return nil, err
+	}
+	banderwagon.BatchMapToScalarField([]*Fr{&poly[2], &poly[3], &poly[4]}, []*Point{c1, c2, c3})
+
+	return &ExpiryLeafNode{
+		// depth will be 0, but the commitment calculation
+		// does not need it, and so it won't be free.
+		values:     values,
+		stem:       stem,
+		epochs:     epochs[:],
+		commitment: cfg.CommitToPoly(poly[:], NodeWidth-4),
+		c1:         c1,
+		c2:         c2,
+		c3:         c3,
+		currEpoch:  currEpoch,
+	}, nil
+}
+
 // NewLeafNodeWithNoComms create a leaf node but does compute its
 // commitments. The created node's commitments are intended to be
 // initialized with `SetTrustedBytes` in a deserialization context.
@@ -355,7 +441,7 @@ func (n *InternalNode) InsertStem(stem []byte, values [][]byte, resolver NodeRes
 	case UnknownNode:
 		return errMissingNodeInStateless
 	case Empty:
-		n.cowChild(nChild)
+		n.cowChild(nChild) // Set child node's commitment. If empty, then it's the identity.
 		var err error
 		n.children[nChild], err = NewLeafNode(stem, values)
 		if err != nil {
@@ -1310,7 +1396,7 @@ func fillSuffixTreePoly(poly []Fr, values [][]byte) (int, error) {
 		}
 		count++
 
-		if err := leafToComms(poly[(idx<<1)&0xFF:], val); err != nil {
+		if err := leafToComms(poly[(idx<<1)&0xFF:], val); err != nil { // poly[idx*2 % 256]
 			return 0, err
 		}
 	}
@@ -1335,15 +1421,36 @@ func leafToComms(poly []Fr, val []byte) error {
 		loEnd = len(val)
 	}
 	copy(valLoWithMarker[:loEnd], val[:loEnd])
-	valLoWithMarker[16] = 1 // 2**128
-	if err = FromLEBytes(&poly[0], valLoWithMarker[:]); err != nil {
+	valLoWithMarker[16] = 1                                          // 2**128
+	if err = FromLEBytes(&poly[0], valLoWithMarker[:]); err != nil { // first 128-bit value
 		return err
 	}
 	if len(val) >= 16 {
-		if err = FromLEBytes(&poly[1], val[16:]); err != nil {
+		if err = FromLEBytes(&poly[1], val[16:]); err != nil { // last 128-bit value
 			return err
 		}
 	}
+	return nil
+}
+
+// fillStateEpochPoly updates the state epoch polynomial.
+func fillStateEpochPoly(poly []Fr, values [][]byte, epochs []StateEpoch) error {
+
+	if len(values) != len(epochs) {
+		return fmt.Errorf("values and epochs should have the same length")
+	}
+
+	for i, val := range values {
+		if val == nil {
+			continue
+		}
+
+		// fill up poly
+		if err := FromLEBytes(&poly[i], EpochToBytes(epochs[i])); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -1560,6 +1667,615 @@ func (n *LeafNode) Values() [][]byte {
 	return n.values
 }
 
+func (n *ExpiryLeafNode) Insert(key []byte, value []byte, _ NodeResolverFn) error {
+	if len(key) != StemSize+1 {
+		return fmt.Errorf("invalid key size: %d", len(key))
+	}
+	if !bytes.Equal(key[:StemSize], n.stem) {
+		return fmt.Errorf("stems doesn't match: %x != %x", key[:StemSize], n.stem)
+	}
+	values := make([][]byte, NodeWidth)
+	values[key[StemSize]] = value
+	return n.insertMultiple(key[:StemSize], values)
+}
+
+func (n *ExpiryLeafNode) insertMultiple(stem []byte, values [][]byte) error {
+	// Sanity check: ensure the stems are the same.
+	if !equalPaths(stem, n.stem) {
+		return errInsertIntoOtherStem
+	}
+
+	return n.updateMultipleLeaves(values, n.currEpoch)
+}
+
+func (n *ExpiryLeafNode) updateC(cxIndex int, newC Fr, oldC Fr) {
+	// Calculate the Fr-delta.
+	var deltaC Fr
+	deltaC.Sub(&newC, &oldC)
+
+	// Calculate the Point-delta.
+	var poly [NodeWidth]Fr
+	poly[cxIndex] = deltaC
+
+	// Add delta to the current commitment.
+	n.commitment.Add(n.commitment, cfg.CommitToPoly(poly[:], 0))
+}
+
+func (n *ExpiryLeafNode) updateCn(index byte, value []byte, c *Point) error {
+	var (
+		old, newH [2]Fr
+		diff      Point
+		poly      [NodeWidth]Fr
+	)
+
+	// Optimization idea:
+	// If the value is created (i.e. not overwritten), the leaf marker
+	// is already present in the commitment. In order to save computations,
+	// do not include it. The result should be the same,
+	// but the computation time should be faster as one doesn't need to
+	// compute 1 - 1 mod N.
+	err := leafToComms(old[:], n.values[index])
+	if err != nil {
+		return err
+	}
+	if err = leafToComms(newH[:], value); err != nil {
+		return err
+	}
+
+	newH[0].Sub(&newH[0], &old[0])
+	poly[2*(index%128)] = newH[0]
+	diff = cfg.conf.Commit(poly[:])
+	poly[2*(index%128)].SetZero()
+	c.Add(c, &diff)
+
+	newH[1].Sub(&newH[1], &old[1])
+	poly[2*(index%128)+1] = newH[1]
+	diff = cfg.conf.Commit(poly[:])
+	c.Add(c, &diff)
+
+	return nil
+}
+
+func (n *ExpiryLeafNode) updateCnEpoch(index byte, c *Point, epoch StateEpoch) error {
+	// The rough flow may look something like:
+	// 1. Get the field element of old epoch
+	// 2. Get the field element of new epoch (current epoch)
+	// 3. Do something similar to newH.Sub(newH, oldH)
+	// 4. Get the difference between the two
+	// 5. Add the difference to the current commitment
+
+	var (
+		old, new Fr
+		diff     Point
+		poly     [NodeWidth]Fr
+	)
+
+	// fill up poly
+	oldEpoch := n.GetValueEpoch(index)
+	if err := FromLEBytes(&old, EpochToBytes(oldEpoch)); err != nil {
+		return err
+	}
+
+	if err := FromLEBytes(&new, EpochToBytes(epoch)); err != nil {
+		return err
+	}
+
+	new.Sub(&new, &old)
+	poly[index] = new
+	diff = cfg.conf.Commit(poly[:])
+	c.Add(c, &diff)
+
+	return nil
+}
+
+func (n *ExpiryLeafNode) updateLeaf(index byte, value []byte, epoch StateEpoch) error {
+
+	// Update the corresponding C1 or C2 commitment.
+	var c *Point
+	var oldC Point
+	var c3 *Point
+	var oldC3 Point
+	if index < NodeWidth/2 {
+		c = n.c1
+		oldC = *n.c1
+	} else {
+		c = n.c2
+		oldC = *n.c2
+	}
+	if err := n.updateCn(index, value, c); err != nil {
+		return err
+	}
+
+	// Batch the Fr transformation of the new and old CX.
+	var frs [2]Fr
+	banderwagon.BatchMapToScalarField([]*Fr{&frs[0], &frs[1]}, []*Point{c, &oldC})
+
+	// If index is in the first NodeWidth/2 elements, we need to update C1. Otherwise, C2.
+	cxIndex := 2 + int(index)/(NodeWidth/2) // [1, stem, -> C1, C2 <-]
+	n.updateC(cxIndex, frs[0], frs[1])
+
+	n.values[index] = value
+
+	c3 = n.c3
+	oldC3 = *n.c3
+
+	if err := n.updateCnEpoch(index, c3, epoch); err != nil {
+		return err
+	}
+
+	// Update the state epoch
+	n.UpdateValueEpoch(index, epoch)
+
+	// Update the corresponding C3 commitment.
+	var frsEpoch [2]Fr
+	c3Index := 4
+	banderwagon.BatchMapToScalarField([]*Fr{&frsEpoch[0], &frsEpoch[1]}, []*Point{c3, &oldC3})
+	n.updateC(c3Index, frsEpoch[0], frsEpoch[1])
+
+	return nil
+}
+
+func (n *ExpiryLeafNode) updateMultipleLeaves(values [][]byte, epoch StateEpoch) error {
+	var oldC1, oldC2, oldC3 *Point
+
+	// We iterate the values, and we update the C1 and/or C2 commitments depending on the index.
+	// If any of them is touched, we save the original point so we can update the LeafNode root
+	// commitment. We copy the original point in oldC1 and oldC2, so we can batch their Fr transformation
+	// after this loop.
+	for i, v := range values {
+		if len(v) != 0 && !bytes.Equal(v, n.values[i]) {
+			if i < NodeWidth/2 {
+				// First time we touch C1? Save the original point for later.
+				if oldC1 == nil {
+					oldC1 = &Point{}
+					oldC1.Set(n.c1)
+				}
+				// We update C1 directly in `n`. We have our original copy in oldC1.
+				if err := n.updateCn(byte(i), v, n.c1); err != nil {
+					return err
+				}
+			} else {
+				// First time we touch C2? Save the original point for later.
+				if oldC2 == nil {
+					oldC2 = &Point{}
+					oldC2.Set(n.c2)
+				}
+				// We update C2 directly in `n`. We have our original copy in oldC2.
+				if err := n.updateCn(byte(i), v, n.c2); err != nil {
+					return err
+				}
+			}
+			n.values[i] = v
+
+			if oldC3 == nil {
+				oldC3 = &Point{}
+				oldC3.Set(n.c3)
+			}
+			if err := n.updateCnEpoch(byte(i), n.c3, epoch); err != nil {
+				return err
+			}
+			n.UpdateValueEpoch(byte(i), epoch)
+		}
+	}
+
+	// We have three potential cases here:
+	// 1. We have touched C1 and C2: we Fr-batch old1, old2 and newC1, newC2. (4x gain ratio)
+	// 2. We have touched only one CX: we Fr-batch oldX and newCX. (2x gain ratio)
+	// 3. No C1 or C2 was touched, this is a noop.
+	var frs [4]Fr
+	const c1Idx = 2 // [1, stem, ->C1<-, C2]
+	const c2Idx = 3 // [1, stem, C1, ->C2<-]
+	const c3Idx = 4 // [1, stem, C1, C2, ->C3<-]
+
+	// No values updated
+	if oldC1 == nil && oldC2 == nil {
+		return nil
+	}
+
+	if oldC1 != nil && oldC2 != nil { // Case 1.
+		banderwagon.BatchMapToScalarField([]*Fr{&frs[0], &frs[1], &frs[2], &frs[3]}, []*Point{n.c1, oldC1, n.c2, oldC2})
+		n.updateC(c1Idx, frs[0], frs[1])
+		n.updateC(c2Idx, frs[2], frs[3])
+	} else if oldC1 != nil { // Case 2. (C1 touched)
+		banderwagon.BatchMapToScalarField([]*Fr{&frs[0], &frs[1]}, []*Point{n.c1, oldC1})
+		n.updateC(c1Idx, frs[0], frs[1])
+	} else if oldC2 != nil { // Case 2. (C2 touched)
+		banderwagon.BatchMapToScalarField([]*Fr{&frs[0], &frs[1]}, []*Point{n.c2, oldC2})
+		n.updateC(c2Idx, frs[0], frs[1])
+	}
+
+	var frsEpoch [2]Fr
+	banderwagon.BatchMapToScalarField([]*Fr{&frsEpoch[0], &frsEpoch[1]}, []*Point{n.c3, oldC3})
+	n.updateC(c3Idx, frsEpoch[0], frsEpoch[1])
+
+	return nil
+}
+
+// Delete deletes a value from the leaf, return `true` as a second
+// return value, if the parent should entirely delete the child.
+func (n *ExpiryLeafNode) Delete(k []byte, _ NodeResolverFn) (bool, error) {
+	// Sanity check: ensure the key header is the same:
+	if !equalPaths(k, n.stem) {
+		return false, nil
+	}
+
+	// Erase the value it used to contain
+	suffixByte := k[StemSize]
+	original := n.values[suffixByte] // save original value
+	n.values[suffixByte] = nil
+	n.UpdateValueEpoch(suffixByte, 0)
+
+	// Check if a Cn subtree is entirely empty, or if
+	// the entire subtree is empty.
+	var (
+		isCnempty = true
+		isCempty  = true
+	)
+	for i := 0; i < NodeWidth; i++ {
+		if len(n.values[i]) > 0 {
+			// if i and k[31] are in the same subtree,
+			// set both values and return.
+			if byte(i/128) == suffixByte/128 {
+				isCnempty = false
+				isCempty = false
+				break
+			}
+
+			// i and k[31] were in a different subtree,
+			// so all we can say at this stage, is that
+			// the whole tree isn't empty.
+			// TODO if i < 128, then k[31] >= 128 and
+			// we could skip to 128, but that's an
+			// optimization for later.
+			isCempty = false
+		}
+	}
+
+	// if the whole subtree is empty, then the
+	// entire node should be deleted.
+	if isCempty {
+		return true, nil
+	}
+
+	// if a Cn branch becomes empty as a result
+	// of removing the last value, update C by
+	// adding -Cn to it and exit.
+	if isCnempty {
+		var (
+			cn           *Point
+			subtreeindex = 2 + suffixByte/128
+		)
+
+		if suffixByte < 128 {
+			cn = n.c1
+		} else {
+			cn = n.c2
+		}
+
+		// Update C by subtracting the old value for Cn
+		// Note: this isn't done in one swoop, which would make sense
+		// since presumably a lot of values would be deleted at the same
+		// time when reorging. Nonetheless, a reorg is an already complex
+		// operation which is slow no matter what, so ensuring correctness
+		// is more important than
+		var poly [4]Fr
+		cn.MapToScalarField(&poly[subtreeindex])
+		n.commitment.Sub(n.commitment, cfg.CommitToPoly(poly[:], 0))
+
+		// Clear the corresponding commitment
+		if suffixByte < 128 {
+			n.c1 = nil
+		} else {
+			n.c2 = nil
+		}
+
+		return false, nil
+	}
+
+	// Recompute the updated C & Cn
+	//
+	// This is done by setting the leaf value
+	// to `nil` at this point, and all the
+	// diff computation will be performed by
+	// updateLeaf since leafToComms supports
+	// nil values.
+	// Note that the value is set to nil by
+	// the method, as it needs the original
+	// value to compute the commitment diffs.
+	n.values[suffixByte] = original
+	return false, n.updateLeaf(suffixByte, nil, 0)
+}
+
+func (n *ExpiryLeafNode) Get(k []byte, _ NodeResolverFn) ([]byte, error) {
+	if !equalPaths(k, n.stem) {
+		// If keys differ, return nil in order to
+		// signal that the key isn't present in the
+		// tree. Do not return an error, thus matching
+		// the behavior of Geth's SecureTrie.
+		return nil, nil
+	}
+	// value can be nil, as expected by geth
+	return n.values[k[StemSize]], nil
+}
+
+func (n *ExpiryLeafNode) GetAndUpdateEpoch(k []byte, _ NodeResolverFn, epoch StateEpoch) ([]byte, error) {
+	if !equalPaths(k, n.stem) {
+		// If keys differ, return nil in order to
+		// signal that the key isn't present in the
+		// tree. Do not return an error, thus matching
+		// the behavior of Geth's SecureTrie.
+		return nil, nil
+	}
+	// value can be nil, as expected by geth
+	val := n.values[k[StemSize]]
+	if val == nil {
+		return nil, nil
+	}
+
+	// update epoch
+	n.UpdateValueEpoch(k[StemSize], epoch)
+	return n.values[k[StemSize]], nil
+}
+
+func (n *ExpiryLeafNode) Hash() *Fr {
+	// TODO cache this in a subsequent PR, not done here
+	// to reduce complexity.
+	// TODO use n.commitment once all Insert* are diff-inserts
+	var hash Fr
+	n.Commitment().MapToScalarField(&hash)
+	return &hash
+}
+
+func (n *ExpiryLeafNode) Commitment() *Point {
+	if n.commitment == nil {
+		panic("nil commitment")
+	}
+	return n.commitment
+}
+
+func (n *ExpiryLeafNode) Commit() *Point {
+	return n.commitment
+}
+
+// TODO(w): not sure if need to add epoch-related commitments during the second pass
+func (n *ExpiryLeafNode) GetProofItems(keys keylist, _ NodeResolverFn) (*ProofElements, []byte, [][]byte, error) {
+	var (
+		poly [NodeWidth]Fr // top-level polynomial
+		pe                 = &ProofElements{
+			Cis:    []*Point{n.commitment, n.commitment},
+			Zis:    []byte{0, 1},              // 0 = 1, 1 = Stem, 2 = C1, 3 = C2, 4 = C3
+			Yis:    []*Fr{&poly[0], &poly[1]}, // Should be 0
+			Fis:    [][]Fr{poly[:], poly[:]},
+			Vals:   make([][]byte, 0, len(keys)),
+			Epochs: make([]StateEpoch, 0, len(keys)),
+			ByPath: map[string]*Point{},
+		}
+
+		esses []byte   = nil // list of extension statuses
+		poass [][]byte       // list of proof-of-absence stems
+	)
+
+	// Initialize the top-level polynomial with 1 + stem + C1 + C2
+	poly[0].SetUint64(1)
+	if err := StemFromBytes(&poly[1], n.stem); err != nil {
+		return nil, nil, nil, err
+	}
+	banderwagon.BatchMapToScalarField([]*Fr{&poly[2], &poly[3], &poly[4]}, []*Point{n.c1, n.c2, n.c3})
+
+	// First pass: add top-level elements first
+	var hasC1, hasC2 bool
+	for _, key := range keys {
+		hasC1 = hasC1 || (key[31] < 128)
+		hasC2 = hasC2 || (key[31] >= 128)
+		if hasC2 {
+			break
+		}
+	}
+	if hasC1 {
+		pe.Cis = append(pe.Cis, n.commitment)
+		pe.Zis = append(pe.Zis, 2)
+		pe.Yis = append(pe.Yis, &poly[2])
+		pe.Fis = append(pe.Fis, poly[:])
+	}
+	if hasC2 {
+		pe.Cis = append(pe.Cis, n.commitment)
+		pe.Zis = append(pe.Zis, 3)
+		pe.Yis = append(pe.Yis, &poly[3])
+		pe.Fis = append(pe.Fis, poly[:])
+	}
+
+	// add C3
+	pe.Cis = append(pe.Cis, n.commitment)
+	pe.Zis = append(pe.Zis, 4)
+	pe.Yis = append(pe.Yis, &poly[4])
+	pe.Fis = append(pe.Fis, poly[:])
+
+	// Second pass: add the cn-level elements
+	for _, key := range keys {
+		pe.ByPath[string(key[:n.depth])] = n.commitment
+
+		// Proof of absence: case of a differing stem.
+		// Add an unopened stem-level node.
+		if !equalPaths(n.stem, key) {
+			// Corner case: don't add the poa stem if it's
+			// already present as a proof-of-absence for a
+			// different key, or for the same key (case of
+			// multiple missing keys being absent).
+			// The list of extension statuses has to be of
+			// length 1 at this level, so skip otherwise.
+			if len(esses) == 0 {
+				esses = append(esses, extStatusAbsentOther|(n.depth<<3))
+				poass = append(poass, n.stem)
+				pe.Vals = append(pe.Vals, nil)
+				pe.Epochs = append(pe.Epochs, 0)
+			}
+			continue
+		}
+
+		// corner case (see previous corner case): if a proof-of-absence
+		// stem was found, and it now turns out the same stem is used as
+		// a proof of presence, clear the proof-of-absence list to avoid
+		// redundancy.
+		if len(poass) > 0 {
+			poass = nil
+			esses = nil
+		}
+
+		var (
+			suffix   = key[31]
+			suffPoly [NodeWidth]Fr // suffix-level polynomial
+			count    int
+			err      error
+		)
+		if suffix >= 128 {
+			count, err = fillSuffixTreePoly(suffPoly[:], n.values[128:])
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		} else {
+			count, err = fillSuffixTreePoly(suffPoly[:], n.values[:128])
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
+
+		// Proof of absence: case of a missing suffix tree.
+		//
+		// The suffix tree for this value is missing, i.e. all
+		// values in the extension-and-suffix tree are grouped
+		// in the other suffix tree (e.g. C2 if we are looking
+		// at C1).
+		if count == 0 {
+			// TODO(gballet) maintain a count variable at LeafNode level
+			// so that we know not to build the polynomials in this case,
+			// as all the information is available before fillSuffixTreePoly
+			// has to be called, save the count.
+			esses = append(esses, extStatusAbsentEmpty|(n.depth<<3))
+			pe.Vals = append(pe.Vals, nil)
+			pe.Epochs = append(pe.Epochs, 0)
+			continue
+		}
+
+		var scomm *Point
+		if suffix < 128 {
+			scomm = n.c1
+		} else {
+			scomm = n.c2
+		}
+		var leaves [2]Fr
+		if n.values[suffix] == nil {
+			// Proof of absence: case of a missing value.
+			//
+			// Suffix tree is present as a child of the extension,
+			// but does not contain the requested suffix. This can
+			// only happen when the leaf has never been written to
+			// since after deletion the value would be set to zero
+			// but still contain the leaf marker 2^128.
+			leaves[0], leaves[1] = FrZero, FrZero
+		} else {
+			// suffix tree is present and contains the key
+			leaves[0], leaves[1] = suffPoly[2*suffix], suffPoly[2*suffix+1]
+		}
+		pe.Cis = append(pe.Cis, scomm, scomm)
+		pe.Zis = append(pe.Zis, 2*suffix, 2*suffix+1)
+		pe.Yis = append(pe.Yis, &leaves[0], &leaves[1])
+		pe.Fis = append(pe.Fis, suffPoly[:], suffPoly[:])
+		pe.Vals = append(pe.Vals, n.values[key[31]])
+		if len(esses) == 0 || esses[len(esses)-1] != extStatusPresent|(n.depth<<3) {
+			esses = append(esses, extStatusPresent|(n.depth<<3))
+		}
+		slotPath := string(key[:n.depth]) + string([]byte{2 + suffix/128})
+		pe.ByPath[slotPath] = scomm
+	}
+
+	return pe, esses, poass, nil
+}
+
+// Serialize serializes a LeafNode.
+// The format is: <nodeType><stem><bitlist><comm><c1comm><c2comm><c3comm><children...><epoch...>
+func (n *ExpiryLeafNode) Serialize() ([]byte, error) {
+	cBytes := banderwagon.BatchToBytesUncompressed(n.commitment, n.c1, n.c2, n.c3)
+	return n.serializeLeafWithUncompressedCommitments(cBytes[0], cBytes[1], cBytes[2], cBytes[3]), nil
+}
+
+func (n *ExpiryLeafNode) Copy() VerkleNode {
+	l := &ExpiryLeafNode{}
+	l.stem = make([]byte, len(n.stem))
+	l.values = make([][]byte, len(n.values))
+	l.epochs = make([]StateEpoch, len(n.epochs))
+	l.depth = n.depth
+	copy(l.stem, n.stem)
+	for i, v := range n.values {
+		l.values[i] = make([]byte, len(v))
+		copy(l.values[i], v)
+	}
+	copy(l.epochs, n.epochs)
+	if n.commitment != nil {
+		l.commitment = new(Point)
+		l.commitment.Set(n.commitment)
+	}
+	if n.c1 != nil {
+		l.c1 = new(Point)
+		l.c1.Set(n.c1)
+	}
+	if n.c2 != nil {
+		l.c2 = new(Point)
+		l.c2.Set(n.c2)
+	}
+	if n.c3 != nil {
+		l.c3 = new(Point)
+		l.c3.Set(n.c3)
+	}
+
+	return l
+}
+
+func (n *ExpiryLeafNode) Key(i int) []byte {
+	var ret [32]byte
+	copy(ret[:], n.stem)
+	ret[31] = byte(i)
+	return ret[:]
+}
+
+func (n *ExpiryLeafNode) Value(i int) []byte {
+	if i >= NodeWidth {
+		panic("leaf node index out of range")
+	}
+	return n.values[byte(i)]
+}
+
+func (n *ExpiryLeafNode) toDot(parent, path string) string {
+	var hash Fr
+	n.Commitment().MapToScalarField(&hash)
+	ret := fmt.Sprintf("leaf%s [label=\"L: %x\nC: %x\nC₁: %x\nC₂:%x\nC3:%x\"]\n%s -> leaf%s\n", path, hash.Bytes(), n.commitment.Bytes(), n.c1.Bytes(), n.c2.Bytes(), n.c3.Bytes(), parent, path)
+	for i, v := range n.values {
+		if v != nil {
+			ret = fmt.Sprintf("%sval%s%02x [label=\"%x\"]\nleaf%s -> val%s%02x\n", ret, path, i, v, path, path, i)
+		}
+	}
+	return ret
+}
+
+func (n *ExpiryLeafNode) setDepth(d byte) {
+	n.depth = d
+}
+
+func (n *ExpiryLeafNode) Values() [][]byte {
+	return n.values
+}
+
+func (n *ExpiryLeafNode) Epochs() []StateEpoch {
+	return n.epochs
+}
+
+func (n *ExpiryLeafNode) UpdateValueEpoch(index byte, epoch StateEpoch) {
+	n.epochs[index] = epoch
+}
+
+func (n *ExpiryLeafNode) GetValueEpoch(index byte) StateEpoch {
+	return n.epochs[index]
+}
+
 func setBit(bitlist []byte, index int) {
 	bitlist[index/8] |= mask[index%8]
 }
@@ -1708,6 +2424,50 @@ func (n *LeafNode) serializeLeafWithUncompressedCommitments(cBytes, c1Bytes, c2B
 	copy(result[leafC1CommitmentOffset:], c1Bytes[:])
 	copy(result[leafC2CommitmentOffset:], c2Bytes[:])
 	copy(result[leafChildrenOffset:], children)
+
+	return result
+}
+
+func (n *ExpiryLeafNode) serializeLeafWithUncompressedCommitments(cBytes, c1Bytes, c2Bytes, c3Bytes [banderwagon.UncompressedSize]byte) []byte {
+	// Empty value in LeafNode used for padding.
+	var emptyValue [LeafValueSize]byte
+	var emptyEpoch [EpochSize]byte
+
+	// Create bitlist and store in children LeafValueSize (padded) values.
+	children := make([]byte, 0, NodeWidth*LeafValueSize)
+	epochs := make([]byte, 0, NodeWidth*EpochSize)
+	var bitlist [bitlistSize]byte
+	for i, v := range n.values {
+		if v != nil {
+			setBit(bitlist[:], i)
+			children = append(children, v...)
+			if padding := emptyValue[:LeafValueSize-len(v)]; len(padding) != 0 {
+				children = append(children, padding...)
+			}
+
+			epoch := n.epochs[i]
+			if epoch == 0 {
+				panic("epoch cannot be 0 for a non-nil value")
+			}
+
+			epochs = append(epochs, EpochToBytes(epoch)...)
+			if padding := emptyEpoch[:EpochSize-len(epochs)]; len(padding) != 0 {
+				epochs = append(epochs, padding...)
+			}
+		}
+	}
+
+	// Create the serialization.
+	result := make([]byte, nodeTypeSize+StemSize+bitlistSize+4*banderwagon.UncompressedSize+len(children)+len(epochs))
+	result[0] = expiryLeafRLPType
+	copy(result[expiryLeafSteamOffset:], n.stem[:StemSize])
+	copy(result[expiryLeafBitlistOffset:], bitlist[:])
+	copy(result[expiryLeafCommitmentOffset:], cBytes[:])
+	copy(result[expiryLeafC1CommitmentOffset:], c1Bytes[:])
+	copy(result[expiryLeafC2CommitmentOffset:], c2Bytes[:])
+	copy(result[expiryLeafC3CommitmentOffset:], c3Bytes[:])
+	copy(result[expiryLeafChildrenOffset:], children)
+	copy(result[expiryLeafEpochOffset:], epochs)
 
 	return result
 }
