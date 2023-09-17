@@ -64,8 +64,13 @@ const (
 	expiryLeafC1CommitmentOffset = expiryLeafCommitmentOffset + banderwagon.UncompressedSize
 	expiryLeafC2CommitmentOffset = expiryLeafC1CommitmentOffset + banderwagon.UncompressedSize
 	expiryLeafC3CommitmentOffset = expiryLeafC2CommitmentOffset + banderwagon.UncompressedSize
-	expiryLeafChildrenOffset     = expiryLeafC3CommitmentOffset + banderwagon.UncompressedSize
-	expiryLeafEpochOffset        = expiryLeafChildrenOffset + banderwagon.UncompressedSize
+	expiryLeafEpochOffset        = expiryLeafC3CommitmentOffset + banderwagon.UncompressedSize
+	expiryLeafChildrenOffset     = expiryLeafEpochOffset + EpochLength*EpochSize
+
+	// Hash Node offsets
+	hashStemOffset       = nodeTypeOffset + nodeTypeSize
+	hashCommitmentOffset = hashStemOffset + StemSize
+	hashEpochOffset      = hashCommitmentOffset + banderwagon.UncompressedSize
 )
 
 func bit(bitlist []byte, nr int) bool {
@@ -81,6 +86,7 @@ var errSerializedPayloadTooShort = errors.New("verkle payload is too short")
 // The serialized bytes have the format:
 // - Internal nodes: <nodeType><bitlist><commitment>
 // - Leaf nodes:     <nodeType><stem><bitlist><comm><c1comm><c2comm><children...>
+// - Expiry Leaf nodes: <nodeType><stem><bitlist><comm><c1comm><c2comm><c3comm><children...><epoch...>
 func ParseNode(serializedNode []byte, depth byte) (VerkleNode, error) {
 	// Check that the length of the serialized node is at least the smallest possible serialized node.
 	if len(serializedNode) < nodeTypeSize+banderwagon.UncompressedSize {
@@ -92,9 +98,72 @@ func ParseNode(serializedNode []byte, depth byte) (VerkleNode, error) {
 		return parseLeafNode(serializedNode, depth)
 	case internalRLPType:
 		return CreateInternalNode(serializedNode[internalBitlistOffset:internalCommitmentOffset], serializedNode[internalCommitmentOffset:], depth)
+	case expiryLeafRLPType:
+		return parseExpiryLeafNode(serializedNode, depth)
+	case hashedRLPType:
+		return parseExpiryHashedNode(serializedNode)
 	default:
 		return nil, ErrInvalidNodeEncoding
 	}
+}
+
+func parseExpiryHashedNode(serialized []byte) (VerkleNode, error) {
+	n := &ExpiryHashedNode{}
+	n.commitment = new(Point)
+
+	// Get stem
+	n.stem = serialized[hashStemOffset : hashStemOffset+StemSize]
+
+	// Get commitment
+	if len(serialized[hashCommitmentOffset:]) < banderwagon.UncompressedSize {
+		return nil, fmt.Errorf("hash node commitment is not the correct size, expected %d, got %d", banderwagon.UncompressedSize, len(serialized[hashCommitmentOffset:]))
+	}
+	n.commitment.SetBytesUncompressed(serialized[hashCommitmentOffset:hashCommitmentOffset+banderwagon.UncompressedSize], true)
+
+	// Get epoch
+	n.epoch = BytesToEpoch(serialized[hashEpochOffset : hashEpochOffset+EpochSize])
+
+	return n, nil
+}
+
+func parseExpiryLeafNode(serialized []byte, depth byte) (VerkleNode, error) {
+	bitlist := serialized[expiryLeafBitlistOffset : expiryLeafBitlistOffset+bitlistSize]
+	var values [NodeWidth][]byte
+	var epochs [EpochLength]StateEpoch
+	offset := expiryLeafChildrenOffset
+	for i := 0; i < NodeWidth; i++ {
+		if bit(bitlist, i) {
+			if offset+LeafValueSize > len(serialized) {
+				return nil, fmt.Errorf("verkle payload is too short, need at least %d and only have %d, payload = %x (%w)", offset+32, len(serialized), serialized, errSerializedPayloadTooShort)
+			}
+			values[i] = serialized[offset : offset+LeafValueSize]
+			offset += LeafValueSize
+		}
+	}
+
+	epochOffset := expiryLeafEpochOffset
+	for i := 0; i < EpochLength; i++ {
+		epochs[i] = BytesToEpoch(serialized[epochOffset : epochOffset+EpochSize])
+		epochOffset += EpochSize
+	}
+
+	ln := NewExpiryLeafNodeWithNoComms(serialized[expiryLeafSteamOffset:expiryLeafSteamOffset+StemSize], values[:])
+	ln.setDepth(depth)
+	ln.c1 = new(Point)
+
+	// Sanity check that we have at least 4*banderwagon.UncompressedSize bytes left in the serialized payload.
+	if len(serialized[expiryLeafCommitmentOffset:]) < 4*banderwagon.UncompressedSize {
+		return nil, fmt.Errorf("expiry leaf node commitments are not the correct size, expected at least %d, got %d", 4*banderwagon.UncompressedSize, len(serialized[expiryLeafC1CommitmentOffset:]))
+	}
+
+	ln.c1.SetBytesUncompressed(serialized[expiryLeafC1CommitmentOffset:expiryLeafC1CommitmentOffset+banderwagon.UncompressedSize], true)
+	ln.c2 = new(Point)
+	ln.c2.SetBytesUncompressed(serialized[expiryLeafC2CommitmentOffset:expiryLeafC2CommitmentOffset+banderwagon.UncompressedSize], true)
+	ln.c3 = new(Point)
+	ln.c3.SetBytesUncompressed(serialized[expiryLeafC3CommitmentOffset:expiryLeafC3CommitmentOffset+banderwagon.UncompressedSize], true)
+	ln.commitment = new(Point)
+	ln.commitment.SetBytesUncompressed(serialized[expiryLeafCommitmentOffset:expiryLeafC1CommitmentOffset], true)
+	return ln, nil
 }
 
 func parseLeafNode(serialized []byte, depth byte) (VerkleNode, error) {

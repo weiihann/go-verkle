@@ -204,7 +204,7 @@ func (n *InternalNode) insertMigratedLeavesSubtree(leaves []LeafNode, resolver N
 			}
 			// Create the missing internal nodes.
 			for i := parent.depth + 1; i <= byte(idx); i++ {
-				nextParent := newInternalNode(parent.depth + 1).(*InternalNode)
+				nextParent := newInternalNode(parent.depth+1, 0).(*InternalNode)
 				parent.cowChild(ln.stem[parent.depth])
 				parent.children[ln.stem[parent.depth]] = nextParent
 				parent = nextParent

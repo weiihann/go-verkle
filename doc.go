@@ -35,6 +35,8 @@ var (
 	errInsertIntoOtherStem    = errors.New("insert splits a stem where it should not happen")
 	errUnknownNodeType        = errors.New("unknown node type detected")
 	errMissingNodeInStateless = errors.New("trying to access a node that is missing from the stateless view")
+	errExpiredValue           = errors.New("trying to access an expired value")
+	errExpiredLeafNode        = errors.New("trying to access an expired leaf node")
 )
 
 const (
@@ -42,4 +44,5 @@ const (
 	extStatusAbsentEmpty = byte(iota) // missing child node along the path
 	extStatusAbsentOther              // path led to a node with a different stem
 	extStatusPresent                  // stem was present
+	extStatusExpired                  // stem was present but expired
 )
