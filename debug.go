@@ -43,4 +43,15 @@ type (
 		C1 [32]byte `json:"c1"`
 		C2 [32]byte `json:"c2"`
 	}
+
+	ExportableExpiryLeafNode struct {
+		Stem   []byte       `json:"stem"`
+		Values [][]byte     `json:"values"`
+		Epochs []StateEpoch `json:"epochs"`
+
+		C  [32]byte `json:"commitment"`
+		C1 [32]byte `json:"c1"`
+		C2 [32]byte `json:"c2"`
+		C3 [32]byte `json:"c3"`
+	}
 )

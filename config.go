@@ -32,6 +32,7 @@ import (
 const (
 	LeafValueSize      = 32
 	NodeWidth          = 256
+	EpochLength        = 2
 	NodeBitWidth  byte = 8
 	StemSize           = 31
 	EpochSize          = 16

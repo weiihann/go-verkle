@@ -28,9 +28,17 @@ package verkle
 import (
 	"errors"
 	"fmt"
+
+	"github.com/crate-crypto/go-ipa/banderwagon"
 )
 
 type HashedNode struct{}
+
+type ExpiryHashedNode struct {
+	stem       []byte
+	commitment *Point
+	epoch      StateEpoch
+}
 
 func (HashedNode) Insert([]byte, []byte, NodeResolverFn) error {
 	return errInsertIntoHash
@@ -45,17 +53,11 @@ func (HashedNode) Get([]byte, NodeResolverFn) ([]byte, error) {
 }
 
 func (HashedNode) Commit() *Point {
-	// TODO: we should reconsider what to do with the VerkleNode interface and how
-	//       HashedNode fits into the picture, since Commit(), Commitment() and Hash()
-	//	     now panics. Despite these calls must not happen at runtime, it is still
-	//	     quite risky. The reason we end up in this place is because PBSS came quite
-	//	     recently compared with the VerkleNode interface design. We should probably
-	//	     reconsider splitting the interface or find some safer workaround.
-	panic("can not commit a hash node")
+	panic("cannot commit a hashed node")
 }
 
-func (HashedNode) Commitment() *Point {
-	panic("can not get commitment of a hash node")
+func (n HashedNode) Commitment() *Point {
+	return nil
 }
 
 func (HashedNode) GetProofItems(keylist, NodeResolverFn) (*ProofElements, []byte, [][]byte, error) {
@@ -80,4 +82,87 @@ func (HashedNode) setDepth(_ byte) {
 
 func (HashedNode) Hash() *Fr {
 	panic("can not hash a hashed node")
+}
+
+func (n *ExpiryHashedNode) Insert([]byte, []byte, NodeResolverFn) error {
+	return errInsertIntoHash
+}
+
+func (n *ExpiryHashedNode) Delete([]byte, NodeResolverFn) (bool, error) {
+	return false, errors.New("cant delete a hashed node in-place")
+}
+
+func (n *ExpiryHashedNode) Get([]byte, NodeResolverFn) ([]byte, error) {
+	return nil, errors.New("can not read from a hash node")
+}
+
+func (n *ExpiryHashedNode) Commit() *Point {
+	return n.commitment
+}
+
+func (n *ExpiryHashedNode) Commitment() *Point {
+	return n.commitment
+}
+
+func (n *ExpiryHashedNode) GetProofItems(keylist, NodeResolverFn) (*ProofElements, []byte, [][]byte, error) {
+	return nil, nil, nil, nil
+}
+
+func (n *ExpiryHashedNode) GetEpoch() StateEpoch {
+	return n.epoch
+}
+
+func (n *ExpiryHashedNode) UpdateEpoch(epoch StateEpoch) {
+	n.epoch = epoch
+}
+
+// The format is: <nodeType><stem><commitment><epoch>
+func (n *ExpiryHashedNode) Serialize() ([]byte, error) {
+
+	var emptyEpoch [EpochSize]byte
+
+	ret := make([]byte, StemSize+nodeTypeSize+EpochSize+banderwagon.UncompressedSize)
+	ret[nodeTypeOffset] = hashedRLPType
+
+	// copy the stem
+	copy(ret[hashStemOffset:], n.stem)
+
+	// copy the commitment
+	cBytes := banderwagon.BatchToBytesUncompressed(n.commitment)
+	copy(ret[hashCommitmentOffset:], cBytes[0][:])
+
+	epoch := EpochToBytes(n.GetEpoch())
+	if padding := emptyEpoch[:EpochSize-len(epoch)]; len(padding) != 0 {
+		epoch = append(epoch, padding...)
+	}
+	copy(ret[hashEpochOffset:], epoch)
+
+	return ret, nil
+}
+
+func (n *ExpiryHashedNode) Copy() VerkleNode {
+	return &ExpiryHashedNode{
+		stem:       n.stem,
+		commitment: n.commitment,
+		epoch:      n.epoch,
+	}
+}
+
+func (n *ExpiryHashedNode) toDot(parent, path string) string {
+	return fmt.Sprintf("hash%s [label=\"unresolved\"]\n%s -> hash%s\n", path, parent, path)
+}
+
+func (n *ExpiryHashedNode) setDepth(_ byte) {
+	// do nothing
+}
+
+func (n *ExpiryHashedNode) Hash() *Fr {
+	panic("can not hash a hashed node")
+}
+
+func (n *ExpiryHashedNode) EnableExpiry() bool {
+	if n.epoch != 0 && n.commitment != nil {
+		return true
+	}
+	return false
 }

@@ -102,7 +102,6 @@ type ProofElements struct {
 	Fis    [][]Fr
 	ByPath map[string]*Point // Gather commitments by path
 	Vals   [][]byte          // list of values read from the tree
-	Epochs []StateEpoch      // list of epochs read from the tree
 	// dedups flags the presence of each (Ci,zi) tuple
 	dedups map[*Point]map[byte]struct{}
 }
@@ -159,6 +158,7 @@ const (
 	internalRLPType   byte = 1
 	leafRLPType       byte = 2
 	expiryLeafRLPType byte = 3
+	hashedRLPType     byte = 4
 )
 
 type (
@@ -174,6 +174,8 @@ type (
 		commitment *Point
 
 		cow map[byte]*Point
+
+		currEpoch StateEpoch
 	}
 
 	LeafNode struct {
@@ -185,6 +187,7 @@ type (
 
 		depth byte
 	}
+
 	ExpiryLeafNode struct {
 		stem   []byte
 		values [][]byte
@@ -220,6 +223,16 @@ func (n *InternalNode) toExportable() *ExportableInternalNode {
 				C:      child.commitment.Bytes(),
 				C1:     child.c1.Bytes(),
 			}
+		case *ExpiryLeafNode:
+			exportable.Children[i] = &ExportableExpiryLeafNode{
+				Stem:   child.stem,
+				Values: child.values,
+				Epochs: child.epochs,
+				C:      child.commitment.Bytes(),
+				C1:     child.c1.Bytes(),
+				C2:     child.c2.Bytes(),
+				C3:     child.c3.Bytes(),
+			}
 		default:
 			panic("unexportable type")
 		}
@@ -232,7 +245,7 @@ func (n *InternalNode) ToJSON() ([]byte, error) {
 	return json.Marshal(n.toExportable())
 }
 
-func newInternalNode(depth byte) VerkleNode {
+func newInternalNode(depth byte, epoch StateEpoch) VerkleNode {
 	node := new(InternalNode)
 	node.children = make([]VerkleNode, NodeWidth)
 	for idx := range node.children {
@@ -240,12 +253,13 @@ func newInternalNode(depth byte) VerkleNode {
 	}
 	node.depth = depth
 	node.commitment = new(Point).SetIdentity()
+	node.currEpoch = epoch
 	return node
 }
 
 // New creates a new tree root
 func New() VerkleNode {
-	return newInternalNode(0)
+	return newInternalNode(0, 0)
 }
 
 func NewStatelessInternal(depth byte, comm *Point) VerkleNode {
@@ -317,7 +331,7 @@ func NewLeafNode(stem []byte, values [][]byte) (*LeafNode, error) {
 }
 
 // New creates a new leaf node
-func NewExpiryLeafNode(stem []byte, values [][]byte, currEpoch StateEpoch) (*ExpiryLeafNode, error) {
+func NewExpiryLeafNode(stem []byte, values [][]byte, currEpoch, c1Epoch, c2Epoch StateEpoch) (*ExpiryLeafNode, error) {
 	cfg := GetConfig()
 
 	// C1.
@@ -351,17 +365,23 @@ func NewExpiryLeafNode(stem []byte, values [][]byte, currEpoch StateEpoch) (*Exp
 	c2 := cfg.CommitToPoly(c2poly[:], NodeWidth-count)
 
 	// C3.
-	var c3poly [NodeWidth]Fr
-	var epochs [NodeWidth]StateEpoch
+	var c3poly [EpochLength]Fr
+	var epochs [EpochLength]StateEpoch
 	// fill up the epochs
-	for i := 0; i < NodeWidth; i++ {
+	for i := 0; i < NodeWidth/2; i++ {
 		if values[i] != nil {
-			epochs[i] = currEpoch
-		} else {
-			epochs[i] = 0
+			epochs[0] = c1Epoch
+			break
 		}
 	}
-	err = fillStateEpochPoly(c3poly[:], values[:], epochs[:])
+
+	for i := NodeWidth / 2; i < NodeWidth; i++ {
+		if values[i] != nil {
+			epochs[1] = c2Epoch
+			break
+		}
+	}
+	err = fillStateEpochPoly(c3poly[:], epochs[:])
 	if err != nil {
 		return nil, err
 	}
@@ -402,6 +422,13 @@ func NewLeafNodeWithNoComms(stem []byte, values [][]byte) *LeafNode {
 	}
 }
 
+func NewExpiryLeafNodeWithNoComms(stem []byte, values [][]byte) *ExpiryLeafNode {
+	return &ExpiryLeafNode{
+		values: values,
+		stem:   stem,
+	}
+}
+
 // Children return the children of the node. The returned slice is
 // internal to the tree, so callers *must* consider it readonly.
 func (n *InternalNode) Children() []VerkleNode {
@@ -431,7 +458,10 @@ func (n *InternalNode) cowChild(index byte) {
 func (n *InternalNode) Insert(key []byte, value []byte, resolver NodeResolverFn) error {
 	values := make([][]byte, NodeWidth)
 	values[key[31]] = value
-	return n.InsertStem(key[:31], values, resolver)
+	if n.GetCurrEpoch() == 0 {
+		return n.InsertStem(key[:31], values, resolver)
+	}
+	return n.InsertStemWithEpoch(key[:31], key[31], values, resolver, n.currEpoch)
 }
 
 func (n *InternalNode) InsertStem(stem []byte, values [][]byte, resolver NodeResolverFn) error {
@@ -475,7 +505,7 @@ func (n *InternalNode) InsertStem(stem []byte, values [][]byte, resolver NodeRes
 		// on the next word in both keys, a recursion into
 		// the moved leaf node can occur.
 		nextWordInExistingKey := offset2key(child.stem, n.depth+1)
-		newBranch := newInternalNode(n.depth + 1).(*InternalNode)
+		newBranch := newInternalNode(n.depth+1, 0).(*InternalNode)
 		newBranch.cowChild(nextWordInExistingKey)
 		n.children[nChild] = newBranch
 		newBranch.children[nextWordInExistingKey] = child
@@ -498,7 +528,107 @@ func (n *InternalNode) InsertStem(stem []byte, values [][]byte, resolver NodeRes
 	case *InternalNode:
 		n.cowChild(nChild)
 		return child.InsertStem(stem, values, resolver)
+	case *ExpiryHashedNode:
+		panic("verkle tree: impossible to have expiry hashed node when inserting stem without epoch")
+	case *ExpiryLeafNode:
+		panic("verkle tree: impossible to have expiry leaf node when inserting stem without epoch")
 	default: // It should be an UknownNode.
+		return errUnknownNodeType
+	}
+
+	return nil
+}
+
+func (n *InternalNode) InsertStemWithEpoch(stem []byte, suffix byte, values [][]byte, resolver NodeResolverFn, epoch StateEpoch) error {
+	nChild := offset2key(stem, n.depth) // index of the child pointed by the next byte in the key
+
+	switch child := n.children[nChild].(type) {
+	case UnknownNode:
+		return errMissingNodeInStateless
+	case Empty:
+		n.cowChild(nChild) // Set child node's commitment. If empty, then it's the identity.
+		var err error
+		n.children[nChild], err = NewExpiryLeafNode(stem, values, epoch, epoch, epoch)
+		if err != nil {
+			return err
+		}
+		n.children[nChild].setDepth(n.depth + 1)
+	case HashedNode:
+		if resolver == nil {
+			return errInsertIntoHash
+		}
+		serialized, err := resolver(stem[:n.depth+1])
+		if err != nil {
+			return fmt.Errorf("verkle tree: error resolving node %x at depth %d: %w", stem, n.depth, err)
+		}
+		resolved, err := ParseNode(serialized, n.depth+1)
+		if err != nil {
+			return fmt.Errorf("verkle tree: error parsing resolved node %x: %w", stem, err)
+		}
+
+		n.children[nChild] = resolved
+		n.cowChild(nChild)
+		// recurse to handle the case of a LeafNode child that
+		// splits.
+
+		return n.InsertStemWithEpoch(stem, suffix, values, resolver, epoch)
+	case *LeafNode:
+		if EpochExpired(StateEpoch0, epoch) {
+			return errExpiredLeafNode
+		}
+		var err error
+		n.children[nChild], err = NewExpiryLeafNode(child.stem, child.values, epoch, 0, 0)
+		if err != nil {
+			return err
+		}
+		return n.InsertStemWithEpoch(stem, suffix, values, resolver, epoch)
+
+	case *ExpiryLeafNode:
+		childEpoch := child.GetEpoch(suffix)
+		if EpochExpired(childEpoch, epoch) {
+			return errExpiredValue
+		}
+		child.updateCurrEpoch(epoch)
+
+		n.cowChild(nChild)
+		if equalPaths(child.stem, stem) {
+			return child.insertMultiple(stem, values)
+		}
+
+		// A new branch node has to be inserted. Depending
+		// on the next word in both keys, a recursion into
+		// the moved leaf node can occur.
+		nextWordInExistingKey := offset2key(child.stem, n.depth+1)
+		newBranch := newInternalNode(n.depth+1, epoch).(*InternalNode)
+		newBranch.cowChild(nextWordInExistingKey)
+		n.children[nChild] = newBranch
+		newBranch.children[nextWordInExistingKey] = child
+		child.depth += 1
+
+		nextWordInInsertedKey := offset2key(stem, n.depth+1)
+		if nextWordInInsertedKey == nextWordInExistingKey {
+			return newBranch.InsertStemWithEpoch(stem, suffix, values, resolver, epoch)
+		}
+
+		// Next word differs, so this was the last level.
+		// Insert it directly into its final slot.
+		leaf, err := NewExpiryLeafNode(stem, values, epoch, child.epochs[0], child.epochs[1])
+		if err != nil {
+			return err
+		}
+		leaf.UpdateEpoch(suffix, epoch, false)
+
+		leaf.setDepth(n.depth + 2)
+		newBranch.cowChild(nextWordInInsertedKey)
+		newBranch.children[nextWordInInsertedKey] = leaf
+
+	case *ExpiryHashedNode:
+		return errExpiredLeafNode
+	case *InternalNode:
+		n.cowChild(nChild)
+		child.UpdateCurrEpoch(epoch)
+		return child.InsertStemWithEpoch(stem, suffix, values, resolver, epoch)
+	default: // It should be an UnknownNode.
 		return errUnknownNodeType
 	}
 
@@ -510,6 +640,7 @@ func (n *InternalNode) InsertStem(stem []byte, values [][]byte, resolver NodeRes
 // commitments that have not been assigned a node. It returns
 // the same list, save the commitments that were consumed
 // during this call.
+// TODO(hw): add expiry leaf node case, may need separate function, not urgent
 func (n *InternalNode) CreatePath(path []byte, stemInfo stemInfo, comms []*Point, values [][]byte) ([]*Point, error) {
 	if len(path) == 0 {
 		return comms, errors.New("invalid path")
@@ -550,6 +681,7 @@ func (n *InternalNode) CreatePath(path []byte, stemInfo stemInfo, comms []*Point
 			for b, value := range stemInfo.values {
 				newchild.values[b] = value
 			}
+		case extStatusExpired: // TODO(hw)
 		}
 		return comms, nil
 	}
@@ -563,6 +695,8 @@ func (n *InternalNode) CreatePath(path []byte, stemInfo stemInfo, comms []*Point
 	// nothing else to do
 	case *LeafNode:
 		return comms, fmt.Errorf("error rebuilding the tree from a proof: stem %x leads to an already-existing leaf node at depth %x", stemInfo.stem, n.depth)
+	case *ExpiryLeafNode:
+		return comms, fmt.Errorf("error rebuilding the tree from a proof: stem %x leads to an already-existing expiry leaf node at depth %x", stemInfo.stem, n.depth)
 	default:
 		return comms, fmt.Errorf("error rebuilding the tree from a proof: stem %x leads to an unsupported node type %v", stemInfo.stem, child)
 	}
@@ -609,6 +743,65 @@ func (n *InternalNode) GetStem(stem []byte, resolver NodeResolverFn) ([][]byte, 
 		return nil, nil
 	case *InternalNode:
 		return child.GetStem(stem, resolver)
+	case *ExpiryHashedNode:
+		panic("verkle tree: impossible to have expiry hashed node when getting stem without epoch")
+	case *ExpiryLeafNode:
+		panic("verkle tree: impossible to have expiry leaf node when getting stem without epoch")
+	default:
+		return nil, errUnknownNodeType
+	}
+}
+
+func (n *InternalNode) GetStemWithEpoch(stem []byte, suffix byte, resolver NodeResolverFn, epoch StateEpoch) ([][]byte, error) {
+	nchild := offset2key(stem, n.depth) // index of the child pointed by the next byte in the key
+	switch child := n.children[nchild].(type) {
+	case UnknownNode:
+		return nil, errMissingNodeInStateless
+	case Empty:
+		return nil, nil
+	case HashedNode:
+		if resolver == nil {
+			return nil, fmt.Errorf("hashed node %x at depth %d along stem %x could not be resolved: %w", child.Commitment().Bytes(), n.depth, stem, errReadFromInvalid)
+		}
+		serialized, err := resolver(stem[:n.depth+1])
+		if err != nil {
+			return nil, fmt.Errorf("resolving node %x at depth %d: %w", stem, n.depth, err)
+		}
+		resolved, err := ParseNode(serialized, n.depth+1)
+		if err != nil {
+			return nil, fmt.Errorf("verkle tree: error parsing resolved node %x: %w", stem, err)
+		}
+		n.children[nchild] = resolved
+		// recurse to handle the case of a LeafNode child that
+		// splits.
+		return n.GetStemWithEpoch(stem, suffix, resolver, epoch)
+	case *LeafNode:
+		if EpochExpired(StateEpoch0, epoch) {
+			return nil, errExpiredLeafNode
+		}
+		var err error
+		n.children[nchild], err = NewExpiryLeafNode(child.stem, child.values, epoch, 0, 0)
+		if err != nil {
+			return nil, err
+		}
+		return n.GetStemWithEpoch(stem, suffix, resolver, epoch)
+	case *ExpiryLeafNode:
+		childEpoch := child.GetEpoch(suffix)
+		if EpochExpired(childEpoch, epoch) {
+			return nil, errExpiredValue
+		}
+
+		if equalPaths(child.stem, stem) {
+			child.UpdateEpoch(suffix, epoch, false)
+			child.updateCurrEpoch(epoch)
+			return child.values, nil
+		}
+		return nil, nil
+	case *ExpiryHashedNode:
+		return nil, errExpiredLeafNode
+	case *InternalNode:
+		child.UpdateCurrEpoch(epoch)
+		return child.GetStemWithEpoch(stem, suffix, resolver, epoch)
 	default:
 		return nil, errUnknownNodeType
 	}
@@ -681,13 +874,23 @@ func (n *InternalNode) Flush(flush NodeFlushFn) {
 
 	n.Commit()
 	for i, child := range n.children {
-		if c, ok := child.(*InternalNode); ok {
+
+		switch c := child.(type) {
+		case *InternalNode:
 			c.Commit()
 			c.Flush(flushAndCapturePath)
 			n.children[i] = HashedNode{}
-		} else if c, ok := child.(*LeafNode); ok {
+		case *LeafNode:
 			c.Commit()
-			flushAndCapturePath(c.stem[:n.depth+1], n.children[i])
+			flushAndCapturePath(c.stem[:n.depth+1], c)
+			n.children[i] = HashedNode{}
+		case *ExpiryLeafNode:
+			c.Commit()
+			flushAndCapturePath(c.stem[:n.depth+1], c)
+			n.children[i] = HashedNode{}
+		case *ExpiryHashedNode:
+			c.Commit()
+			flushAndCapturePath(c.stem[:n.depth+1], c)
 			n.children[i] = HashedNode{}
 		}
 	}
@@ -703,6 +906,10 @@ func (n *InternalNode) FlushAtDepth(depth uint8, flush NodeFlushFn) {
 		c, ok := child.(*InternalNode)
 		if !ok {
 			if c, ok := child.(*LeafNode); ok {
+				c.Commit()
+				flush(c.stem[:c.depth], c)
+				n.children[i] = HashedNode{}
+			} else if c, ok := child.(*ExpiryLeafNode); ok {
 				c.Commit()
 				flush(c.stem[:c.depth], c)
 				n.children[i] = HashedNode{}
@@ -723,10 +930,19 @@ func (n *InternalNode) FlushAtDepth(depth uint8, flush NodeFlushFn) {
 }
 
 func (n *InternalNode) Get(key []byte, resolver NodeResolverFn) ([]byte, error) {
+	var (
+		stemValues [][]byte
+		err        error
+	)
 	if len(key) != StemSize+1 {
 		return nil, fmt.Errorf("invalid key length, expected %d, got %d", StemSize+1, len(key))
 	}
-	stemValues, err := n.GetStem(key[:StemSize], resolver)
+	if n.GetCurrEpoch() == 0 {
+		stemValues, err = n.GetStem(key[:StemSize], resolver)
+	} else {
+		stemValues, err = n.GetStemWithEpoch(key[:StemSize], key[StemSize], resolver, n.currEpoch)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -1071,6 +1287,14 @@ func (n *InternalNode) toDot(parent, path string) string {
 
 func (n *InternalNode) setDepth(d byte) {
 	n.depth = d
+}
+
+func (n *InternalNode) GetCurrEpoch() StateEpoch {
+	return n.currEpoch
+}
+
+func (n *InternalNode) UpdateCurrEpoch(epoch StateEpoch) {
+	n.currEpoch = epoch
 }
 
 // MergeTrees takes a series of subtrees that got filled following
@@ -1434,19 +1658,14 @@ func leafToComms(poly []Fr, val []byte) error {
 }
 
 // fillStateEpochPoly updates the state epoch polynomial.
-func fillStateEpochPoly(poly []Fr, values [][]byte, epochs []StateEpoch) error {
+func fillStateEpochPoly(poly []Fr, epochs []StateEpoch) error {
 
-	if len(values) != len(epochs) {
-		return fmt.Errorf("values and epochs should have the same length")
+	if len(poly) != len(epochs) {
+		return fmt.Errorf("poly length and epochs must be the same, got %d and %d", len(poly), len(epochs))
 	}
 
-	for i, val := range values {
-		if val == nil {
-			continue
-		}
-
-		// fill up poly
-		if err := FromLEBytes(&poly[i], EpochToBytes(epochs[i])); err != nil {
+	for i, epoch := range epochs {
+		if err := FromLEBytes(&poly[i], EpochToBytes(epoch)); err != nil {
 			return err
 		}
 	}
@@ -1685,7 +1904,7 @@ func (n *ExpiryLeafNode) insertMultiple(stem []byte, values [][]byte) error {
 		return errInsertIntoOtherStem
 	}
 
-	return n.updateMultipleLeaves(values, n.currEpoch)
+	return n.updateMultipleLeaves(values)
 }
 
 func (n *ExpiryLeafNode) updateC(cxIndex int, newC Fr, oldC Fr) {
@@ -1747,11 +1966,14 @@ func (n *ExpiryLeafNode) updateCnEpoch(index byte, c *Point, epoch StateEpoch) e
 	var (
 		old, new Fr
 		diff     Point
-		poly     [NodeWidth]Fr
+		poly     [EpochLength]Fr
 	)
 
 	// fill up poly
-	oldEpoch := n.GetValueEpoch(index)
+	oldEpoch := n.GetEpoch(index)
+	if oldEpoch >= epoch {
+		return nil
+	}
 	if err := FromLEBytes(&old, EpochToBytes(oldEpoch)); err != nil {
 		return err
 	}
@@ -1761,7 +1983,7 @@ func (n *ExpiryLeafNode) updateCnEpoch(index byte, c *Point, epoch StateEpoch) e
 	}
 
 	new.Sub(&new, &old)
-	poly[index] = new
+	poly[ResolveIndex(index)] = new
 	diff = cfg.conf.Commit(poly[:])
 	c.Add(c, &diff)
 
@@ -1770,11 +1992,18 @@ func (n *ExpiryLeafNode) updateCnEpoch(index byte, c *Point, epoch StateEpoch) e
 
 func (n *ExpiryLeafNode) updateLeaf(index byte, value []byte, epoch StateEpoch) error {
 
+	// Check if the epoch is expired
+	cnEpoch := n.GetEpoch(index)
+	if EpochExpired(cnEpoch, n.currEpoch) {
+		return fmt.Errorf("verkle tree: update leaf failed, err: %v", errExpiredValue)
+	}
+
 	// Update the corresponding C1 or C2 commitment.
 	var c *Point
 	var oldC Point
 	var c3 *Point
 	var oldC3 Point
+
 	if index < NodeWidth/2 {
 		c = n.c1
 		oldC = *n.c1
@@ -1799,12 +2028,11 @@ func (n *ExpiryLeafNode) updateLeaf(index byte, value []byte, epoch StateEpoch) 
 	c3 = n.c3
 	oldC3 = *n.c3
 
+	// Update the state epoch
+	n.UpdateEpoch(index, epoch, false)
 	if err := n.updateCnEpoch(index, c3, epoch); err != nil {
 		return err
 	}
-
-	// Update the state epoch
-	n.UpdateValueEpoch(index, epoch)
 
 	// Update the corresponding C3 commitment.
 	var frsEpoch [2]Fr
@@ -1815,15 +2043,25 @@ func (n *ExpiryLeafNode) updateLeaf(index byte, value []byte, epoch StateEpoch) 
 	return nil
 }
 
-func (n *ExpiryLeafNode) updateMultipleLeaves(values [][]byte, epoch StateEpoch) error {
+func (n *ExpiryLeafNode) updateMultipleLeaves(values [][]byte) error {
 	var oldC1, oldC2, oldC3 *Point
 
 	// We iterate the values, and we update the C1 and/or C2 commitments depending on the index.
 	// If any of them is touched, we save the original point so we can update the LeafNode root
 	// commitment. We copy the original point in oldC1 and oldC2, so we can batch their Fr transformation
 	// after this loop.
+
+	c1Expired := EpochExpired(n.epochs[0], n.currEpoch)
+	c2Expired := EpochExpired(n.epochs[1], n.currEpoch)
+
 	for i, v := range values {
 		if len(v) != 0 && !bytes.Equal(v, n.values[i]) {
+			if c1Expired && i < NodeWidth/2 {
+				return errExpiredValue
+			} else if c2Expired && i >= NodeWidth/2 {
+				return errExpiredValue
+			}
+
 			if i < NodeWidth/2 {
 				// First time we touch C1? Save the original point for later.
 				if oldC1 == nil {
@@ -1851,10 +2089,11 @@ func (n *ExpiryLeafNode) updateMultipleLeaves(values [][]byte, epoch StateEpoch)
 				oldC3 = &Point{}
 				oldC3.Set(n.c3)
 			}
-			if err := n.updateCnEpoch(byte(i), n.c3, epoch); err != nil {
+
+			n.UpdateEpoch(byte(i), n.currEpoch, false)
+			if err := n.updateCnEpoch(byte(i), n.c3, n.currEpoch); err != nil {
 				return err
 			}
-			n.UpdateValueEpoch(byte(i), epoch)
 		}
 	}
 
@@ -1894,16 +2133,48 @@ func (n *ExpiryLeafNode) updateMultipleLeaves(values [][]byte, epoch StateEpoch)
 // Delete deletes a value from the leaf, return `true` as a second
 // return value, if the parent should entirely delete the child.
 func (n *ExpiryLeafNode) Delete(k []byte, _ NodeResolverFn) (bool, error) {
+
 	// Sanity check: ensure the key header is the same:
 	if !equalPaths(k, n.stem) {
 		return false, nil
 	}
 
+	suffix := k[StemSize]
+
+	// Check if the epoch is expired
+	cnEpoch := n.GetEpoch(suffix)
+	if EpochExpired(cnEpoch, n.currEpoch) {
+		return false, fmt.Errorf("verkle tree: delete expiry leaf node failed, err: %v", errExpiredValue)
+	}
+
 	// Erase the value it used to contain
-	suffixByte := k[StemSize]
-	original := n.values[suffixByte] // save original value
-	n.values[suffixByte] = nil
-	n.UpdateValueEpoch(suffixByte, 0)
+	original := n.values[suffix] // save original value
+	n.values[suffix] = nil
+
+	// Iterate through the values and set epoch
+	ind := ResolveIndex(suffix)
+	setEpoch := true
+	if ind == 0 {
+		for i := 0; i < NodeWidth/2; i++ {
+			if n.values[i] != nil {
+				setEpoch = false
+				break
+			}
+		}
+		if setEpoch {
+			n.UpdateEpoch(suffix, 0, true)
+		}
+	} else {
+		for i := NodeWidth / 2; i < NodeWidth; i++ {
+			if n.values[i] != nil {
+				setEpoch = false
+				break
+			}
+		}
+		if setEpoch {
+			n.UpdateEpoch(suffix, 0, true)
+		}
+	}
 
 	// Check if a Cn subtree is entirely empty, or if
 	// the entire subtree is empty.
@@ -1915,7 +2186,7 @@ func (n *ExpiryLeafNode) Delete(k []byte, _ NodeResolverFn) (bool, error) {
 		if len(n.values[i]) > 0 {
 			// if i and k[31] are in the same subtree,
 			// set both values and return.
-			if byte(i/128) == suffixByte/128 {
+			if byte(i/128) == suffix/128 {
 				isCnempty = false
 				isCempty = false
 				break
@@ -1943,10 +2214,10 @@ func (n *ExpiryLeafNode) Delete(k []byte, _ NodeResolverFn) (bool, error) {
 	if isCnempty {
 		var (
 			cn           *Point
-			subtreeindex = 2 + suffixByte/128
+			subtreeindex = 2 + suffix/128
 		)
 
-		if suffixByte < 128 {
+		if suffix < 128 {
 			cn = n.c1
 		} else {
 			cn = n.c2
@@ -1963,7 +2234,7 @@ func (n *ExpiryLeafNode) Delete(k []byte, _ NodeResolverFn) (bool, error) {
 		n.commitment.Sub(n.commitment, cfg.CommitToPoly(poly[:], 0))
 
 		// Clear the corresponding commitment
-		if suffixByte < 128 {
+		if suffix < 128 {
 			n.c1 = nil
 		} else {
 			n.c2 = nil
@@ -1982,8 +2253,8 @@ func (n *ExpiryLeafNode) Delete(k []byte, _ NodeResolverFn) (bool, error) {
 	// Note that the value is set to nil by
 	// the method, as it needs the original
 	// value to compute the commitment diffs.
-	n.values[suffixByte] = original
-	return false, n.updateLeaf(suffixByte, nil, 0)
+	n.values[suffix] = original
+	return false, n.updateLeaf(suffix, nil, 0)
 }
 
 func (n *ExpiryLeafNode) Get(k []byte, _ NodeResolverFn) ([]byte, error) {
@@ -1994,11 +2265,19 @@ func (n *ExpiryLeafNode) Get(k []byte, _ NodeResolverFn) ([]byte, error) {
 		// the behavior of Geth's SecureTrie.
 		return nil, nil
 	}
+
+	suffix := k[StemSize]
+
+	cnEpoch := n.GetEpoch(suffix)
+	if EpochExpired(cnEpoch, n.currEpoch) {
+		return nil, fmt.Errorf("verkle tree: get value failed, err: %v", errExpiredValue)
+	}
 	// value can be nil, as expected by geth
-	return n.values[k[StemSize]], nil
+	return n.values[suffix], nil
 }
 
-func (n *ExpiryLeafNode) GetAndUpdateEpoch(k []byte, _ NodeResolverFn, epoch StateEpoch) ([]byte, error) {
+func (n *ExpiryLeafNode) GetWithEpoch(k []byte, _ NodeResolverFn, epoch StateEpoch) ([]byte, error) {
+
 	if !equalPaths(k, n.stem) {
 		// If keys differ, return nil in order to
 		// signal that the key isn't present in the
@@ -2006,15 +2285,24 @@ func (n *ExpiryLeafNode) GetAndUpdateEpoch(k []byte, _ NodeResolverFn, epoch Sta
 		// the behavior of Geth's SecureTrie.
 		return nil, nil
 	}
-	// value can be nil, as expected by geth
+
+	suffix := k[StemSize]
+
+	// Check if the epoch is expired
+	cnEpoch := n.GetEpoch(suffix)
+	if EpochExpired(cnEpoch, n.currEpoch) {
+		return nil, fmt.Errorf("verkle tree: get value failed, err: %v", errExpiredValue)
+	}
 	val := n.values[k[StemSize]]
+
+	// value can be nil, as expected by geth
 	if val == nil {
 		return nil, nil
 	}
 
 	// update epoch
-	n.UpdateValueEpoch(k[StemSize], epoch)
-	return n.values[k[StemSize]], nil
+	n.UpdateEpoch(suffix, epoch, false)
+	return n.values[suffix], nil
 }
 
 func (n *ExpiryLeafNode) Hash() *Fr {
@@ -2037,7 +2325,6 @@ func (n *ExpiryLeafNode) Commit() *Point {
 	return n.commitment
 }
 
-// TODO(w): not sure if need to add epoch-related commitments during the second pass
 func (n *ExpiryLeafNode) GetProofItems(keys keylist, _ NodeResolverFn) (*ProofElements, []byte, [][]byte, error) {
 	var (
 		poly [NodeWidth]Fr // top-level polynomial
@@ -2047,7 +2334,6 @@ func (n *ExpiryLeafNode) GetProofItems(keys keylist, _ NodeResolverFn) (*ProofEl
 			Yis:    []*Fr{&poly[0], &poly[1]}, // Should be 0
 			Fis:    [][]Fr{poly[:], poly[:]},
 			Vals:   make([][]byte, 0, len(keys)),
-			Epochs: make([]StateEpoch, 0, len(keys)),
 			ByPath: map[string]*Point{},
 		}
 
@@ -2092,7 +2378,23 @@ func (n *ExpiryLeafNode) GetProofItems(keys keylist, _ NodeResolverFn) (*ProofEl
 
 	// Second pass: add the cn-level elements
 	for _, key := range keys {
+		var (
+			suffix   = key[31]
+			suffPoly [NodeWidth]Fr // suffix-level polynomial
+			count    int
+			err      error
+		)
+
 		pe.ByPath[string(key[:n.depth])] = n.commitment
+
+		cnEpoch := n.GetEpoch(suffix)
+		expired := EpochExpired(cnEpoch, n.currEpoch)
+		if expired {
+			esses = append(esses, extStatusExpired|(n.depth<<3))
+			poass = append(poass, n.stem)
+			pe.Vals = append(pe.Vals, nil)
+			continue
+		}
 
 		// Proof of absence: case of a differing stem.
 		// Add an unopened stem-level node.
@@ -2107,7 +2409,6 @@ func (n *ExpiryLeafNode) GetProofItems(keys keylist, _ NodeResolverFn) (*ProofEl
 				esses = append(esses, extStatusAbsentOther|(n.depth<<3))
 				poass = append(poass, n.stem)
 				pe.Vals = append(pe.Vals, nil)
-				pe.Epochs = append(pe.Epochs, 0)
 			}
 			continue
 		}
@@ -2121,12 +2422,6 @@ func (n *ExpiryLeafNode) GetProofItems(keys keylist, _ NodeResolverFn) (*ProofEl
 			esses = nil
 		}
 
-		var (
-			suffix   = key[31]
-			suffPoly [NodeWidth]Fr // suffix-level polynomial
-			count    int
-			err      error
-		)
 		if suffix >= 128 {
 			count, err = fillSuffixTreePoly(suffPoly[:], n.values[128:])
 			if err != nil {
@@ -2152,7 +2447,6 @@ func (n *ExpiryLeafNode) GetProofItems(keys keylist, _ NodeResolverFn) (*ProofEl
 			// has to be called, save the count.
 			esses = append(esses, extStatusAbsentEmpty|(n.depth<<3))
 			pe.Vals = append(pe.Vals, nil)
-			pe.Epochs = append(pe.Epochs, 0)
 			continue
 		}
 
@@ -2268,12 +2562,28 @@ func (n *ExpiryLeafNode) Epochs() []StateEpoch {
 	return n.epochs
 }
 
-func (n *ExpiryLeafNode) UpdateValueEpoch(index byte, epoch StateEpoch) {
-	n.epochs[index] = epoch
+func (n *ExpiryLeafNode) UpdateEpoch(index byte, epoch StateEpoch, force bool) {
+	ind := ResolveIndex(index)
+	if epoch > n.epochs[ind] || force {
+		n.epochs[ind] = epoch
+	}
 }
 
-func (n *ExpiryLeafNode) GetValueEpoch(index byte) StateEpoch {
-	return n.epochs[index]
+func (n *ExpiryLeafNode) updateCurrEpoch(epoch StateEpoch) {
+	n.currEpoch = epoch
+}
+
+func (n *ExpiryLeafNode) GetEpoch(index byte) StateEpoch {
+	ind := ResolveIndex(index)
+	return n.epochs[ind]
+}
+
+// Function used to resolve index to 0 or 1
+func ResolveIndex(index byte) byte {
+	if index < NodeWidth/2 {
+		return 0 // c1's value
+	}
+	return 1 // c2's value
 }
 
 func setBit(bitlist []byte, index int) {
@@ -2435,25 +2745,41 @@ func (n *ExpiryLeafNode) serializeLeafWithUncompressedCommitments(cBytes, c1Byte
 
 	// Create bitlist and store in children LeafValueSize (padded) values.
 	children := make([]byte, 0, NodeWidth*LeafValueSize)
-	epochs := make([]byte, 0, NodeWidth*EpochSize)
+	epochs := make([]byte, 0, EpochLength*EpochSize)
 	var bitlist [bitlistSize]byte
-	for i, v := range n.values {
-		if v != nil {
-			setBit(bitlist[:], i)
-			children = append(children, v...)
-			if padding := emptyValue[:LeafValueSize-len(v)]; len(padding) != 0 {
-				children = append(children, padding...)
-			}
 
-			epoch := n.epochs[i]
-			if epoch == 0 {
-				panic("epoch cannot be 0 for a non-nil value")
-			}
+	c1Expired := EpochExpired(n.epochs[0], n.currEpoch)
+	c2Expired := EpochExpired(n.epochs[1], n.currEpoch)
 
-			epochs = append(epochs, EpochToBytes(epoch)...)
-			if padding := emptyEpoch[:EpochSize-len(epochs)]; len(padding) != 0 {
-				epochs = append(epochs, padding...)
+	if !c1Expired {
+		for i := 0; i < NodeWidth/2; i++ {
+			if v := n.values[i]; v != nil {
+				setBit(bitlist[:], i)
+				children = append(children, v...)
+				if padding := emptyValue[:LeafValueSize-len(v)]; len(padding) != 0 {
+					children = append(children, padding...)
+				}
 			}
+		}
+	}
+
+	if !c2Expired {
+		for i := NodeWidth / 2; i < NodeWidth; i++ {
+			if v := n.values[i]; v != nil {
+				setBit(bitlist[:], i)
+				children = append(children, v...)
+				if padding := emptyValue[:LeafValueSize-len(v)]; len(padding) != 0 {
+					children = append(children, padding...)
+				}
+			}
+		}
+	}
+
+	for _, epoch := range n.epochs {
+		epochBytes := EpochToBytes(epoch)
+		epochs = append(epochs, epochBytes...)
+		if padding := emptyEpoch[:EpochSize-len(epochBytes)]; len(padding) != 0 {
+			epochs = append(epochs, padding...)
 		}
 	}
 
@@ -2466,8 +2792,8 @@ func (n *ExpiryLeafNode) serializeLeafWithUncompressedCommitments(cBytes, c1Byte
 	copy(result[expiryLeafC1CommitmentOffset:], c1Bytes[:])
 	copy(result[expiryLeafC2CommitmentOffset:], c2Bytes[:])
 	copy(result[expiryLeafC3CommitmentOffset:], c3Bytes[:])
-	copy(result[expiryLeafChildrenOffset:], children)
 	copy(result[expiryLeafEpochOffset:], epochs)
+	copy(result[expiryLeafChildrenOffset:], children)
 
 	return result
 }
