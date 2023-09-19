@@ -55,6 +55,10 @@ func (UnknownNode) GetProofItems(keylist, NodeResolverFn) (*ProofElements, []byt
 	return nil, nil, nil, errors.New("can't generate proof items for unknown node")
 }
 
+func (UnknownNode) GetProofItemsWithEpoch(keylist, NodeResolverFn, StateEpoch) (*ProofElements, []byte, [][]byte, error) {
+	return nil, nil, nil, errors.New("can't generate proof items for unknown node")
+}
+
 func (UnknownNode) Serialize() ([]byte, error) {
 	return nil, errors.New("trying to serialize a subtree missing from the statless view")
 }

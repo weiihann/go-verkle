@@ -902,6 +902,145 @@ func TestProofVerificationWithPostState(t *testing.T) {
 		})
 	}
 }
+
+func TestProofVerifyTwoLeavesEpoch1(t *testing.T) {
+	t.Parallel()
+	cfg := GetConfig()
+
+	root := New()
+	root.(*InternalNode).UpdateCurrEpoch(1)
+	root.Insert(zeroKeyTest, zeroKeyTest, nil)
+	root.Insert(oneKeyTest, zeroKeyTest, nil)
+	root.Insert(ffx32KeyTest, zeroKeyTest, nil)
+	root.Commit()
+
+	proof, cis, zis, yis, _ := MakeVerkleMultiProof(root, nil, [][]byte{ffx32KeyTest}, nil)
+
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{zeroKeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{oneKeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	// Multiproof
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{zeroKeyTest, oneKeyTest, ffx32KeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+}
+
+// TODO(w): check this
+func TestProofVerifyTwoLeavesEpoch1Epoch2(t *testing.T) {
+	t.Parallel()
+	cfg := GetConfig()
+
+	root := New()
+	root.(*InternalNode).UpdateCurrEpoch(1)
+	root.Insert(zeroKeyTest, zeroKeyTest, nil)
+	root.Insert(oneKeyTest, zeroKeyTest, nil)
+
+	root.(*InternalNode).UpdateCurrEpoch(2)
+	root.Insert(ffx32KeyTest, zeroKeyTest, nil)
+	root.Commit()
+
+	proof, cis, zis, yis, _ := MakeVerkleMultiProof(root, nil, [][]byte{ffx32KeyTest}, nil)
+
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{zeroKeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{oneKeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	// Multiproof
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{zeroKeyTest, oneKeyTest, ffx32KeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+}
+
+func TestProofVerifyTwoLeavesEpoch1Epoch3(t *testing.T) {
+	t.Parallel()
+	cfg := GetConfig()
+
+	root := New()
+	root.(*InternalNode).UpdateCurrEpoch(1)
+	root.Insert(zeroKeyTest, zeroKeyTest, nil)
+	root.Insert(oneKeyTest, zeroKeyTest, nil)
+
+	root.(*InternalNode).UpdateCurrEpoch(3)
+	root.Insert(ffx32KeyTest, zeroKeyTest, nil)
+	root.Commit()
+
+	proof, cis, zis, yis, _ := MakeVerkleMultiProof(root, nil, [][]byte{ffx32KeyTest}, nil)
+
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{zeroKeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{oneKeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	// Multiproof
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{zeroKeyTest, oneKeyTest, ffx32KeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+}
+
+func TestProofVerifyTwoLeavesEpoch0Epoch2(t *testing.T) {
+	t.Parallel()
+	cfg := GetConfig()
+
+	root := New()
+	root.Insert(zeroKeyTest, zeroKeyTest, nil)
+	root.Insert(oneKeyTest, zeroKeyTest, nil)
+
+	root.(*InternalNode).UpdateCurrEpoch(2)
+	root.Insert(ffx32KeyTest, zeroKeyTest, nil)
+	root.Commit()
+
+	proof, cis, zis, yis, _ := MakeVerkleMultiProof(root, nil, [][]byte{ffx32KeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{zeroKeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{oneKeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+
+	// Multiproof
+	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{zeroKeyTest, oneKeyTest, ffx32KeyTest}, nil)
+	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
+		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
 func TestProofOfAbsenceBorderCase(t *testing.T) {
 	root := New()
 

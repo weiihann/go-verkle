@@ -116,6 +116,12 @@ func (sd StateDiff) Copy() StateDiff {
 
 func GetCommitmentsForMultiproof(root VerkleNode, keys [][]byte, resolver NodeResolverFn) (*ProofElements, []byte, [][]byte, error) {
 	sort.Sort(keylist(keys))
+	if n, ok := root.(*InternalNode); ok {
+		if n.currEpoch == 0 {
+			return n.GetProofItems(keys, resolver)
+		}
+		return n.GetProofItemsWithEpoch(keys, resolver, n.currEpoch)
+	}
 	return root.GetProofItems(keylist(keys), resolver)
 }
 
@@ -405,6 +411,7 @@ type stemInfo struct {
 }
 
 // PreStateTreeFromProof builds a stateless prestate tree from the proof.
+// TODO(hw): add extStatusExpiry case
 func PreStateTreeFromProof(proof *Proof, rootC *Point) (VerkleNode, error) { // skipcq: GO-R1005
 	if len(proof.Keys) != len(proof.PreValues) {
 		return nil, fmt.Errorf("incompatible number of keys and values: %d != %d", len(proof.Keys), len(proof.PreValues))

@@ -56,12 +56,16 @@ func (HashedNode) Commit() *Point {
 	panic("cannot commit a hashed node")
 }
 
-func (n HashedNode) Commitment() *Point {
+func (HashedNode) Commitment() *Point {
 	return nil
 }
 
 func (HashedNode) GetProofItems(keylist, NodeResolverFn) (*ProofElements, []byte, [][]byte, error) {
 	return nil, nil, nil, errors.New("can not get the full path, and there is no proof of absence")
+}
+
+func (HashedNode) GetProofItemsWithEpoch(keys keylist, resolver NodeResolverFn, epoch StateEpoch) (*ProofElements, []byte, [][]byte, error) {
+	return nil, nil, nil, errors.New("trying to produce a commitment for an empty subtree")
 }
 
 func (HashedNode) Serialize() ([]byte, error) {
@@ -105,6 +109,10 @@ func (n *ExpiryHashedNode) Commitment() *Point {
 }
 
 func (n *ExpiryHashedNode) GetProofItems(keylist, NodeResolverFn) (*ProofElements, []byte, [][]byte, error) {
+	return nil, nil, nil, nil
+}
+
+func (n *ExpiryHashedNode) GetProofItemsWithEpoch(keys keylist, resolver NodeResolverFn, epoch StateEpoch) (*ProofElements, []byte, [][]byte, error) {
 	return nil, nil, nil, nil
 }
 

@@ -82,6 +82,8 @@ type VerkleNode interface {
 	// if the key is missing but another stem has been found.
 	GetProofItems(keylist, NodeResolverFn) (*ProofElements, []byte, [][]byte, error)
 
+	GetProofItemsWithEpoch(keylist, NodeResolverFn, StateEpoch) (*ProofElements, []byte, [][]byte, error)
+
 	// Serialize encodes the node to RLP.
 	Serialize() ([]byte, error)
 
@@ -1217,6 +1219,108 @@ func (n *InternalNode) GetProofItems(keys keylist, resolver NodeResolverFn) (*Pr
 	return pe, esses, poass, nil
 }
 
+func (n *InternalNode) GetProofItemsWithEpoch(keys keylist, resolver NodeResolverFn, epoch StateEpoch) (*ProofElements, []byte, [][]byte, error) {
+	var (
+		groups = groupKeys(keys, n.depth)
+		pe     = &ProofElements{
+			Cis:    []*Point{},
+			Zis:    []byte{},
+			Yis:    []*Fr{}, // Should be 0
+			Fis:    [][]Fr{},
+			ByPath: map[string]*Point{},
+		}
+
+		esses []byte   = nil // list of extension statuses
+		poass [][]byte       // list of proof-of-absence stems
+	)
+
+	// fill in the polynomial for this node
+	var fi [NodeWidth]Fr
+	var fiPtrs [NodeWidth]*Fr
+	var points [NodeWidth]*Point
+	for i, child := range n.children {
+		fiPtrs[i] = &fi[i]
+		if child != nil {
+			var c VerkleNode
+			if _, ok := child.(HashedNode); ok {
+				childpath := make([]byte, n.depth+1)
+				copy(childpath[:n.depth+1], keys[0][:n.depth])
+				childpath[n.depth] = byte(i)
+				if resolver == nil {
+					return nil, nil, nil, fmt.Errorf("no resolver for path %x", childpath)
+				}
+				serialized, err := resolver(childpath)
+				if err != nil {
+					return nil, nil, nil, fmt.Errorf("error resolving for path %x: %w", childpath, err)
+				}
+				c, err = ParseNode(serialized, n.depth+1)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+			} else {
+				c = child
+			}
+			points[i] = c.Commitment()
+		} else {
+			// TODO: add a test case to cover this scenario.
+			points[i] = new(Point)
+		}
+	}
+	banderwagon.BatchMapToScalarField(fiPtrs[:], points[:])
+
+	for _, group := range groups {
+		childIdx := offset2key(group[0], n.depth)
+
+		// Build the list of elements for this level
+		var yi Fr
+		yi.Set(&fi[childIdx])
+
+		pe.Cis = append(pe.Cis, n.commitment)
+		pe.Zis = append(pe.Zis, childIdx)
+		pe.Yis = append(pe.Yis, &yi)
+		pe.Fis = append(pe.Fis, fi[:])
+		pe.ByPath[string(group[0][:n.depth])] = n.commitment
+	}
+
+	// Loop over again, collecting the children's proof elements
+	// This is because the order is breadth-first.
+	for _, group := range groups {
+		childIdx := offset2key(group[0], n.depth)
+
+		if _, isunknown := n.children[childIdx].(UnknownNode); isunknown {
+			// TODO: add a test case to cover this scenario.
+			return nil, nil, nil, errMissingNodeInStateless
+		}
+
+		// Special case of a proof of absence: no children
+		// commitment, as the value is 0.
+		_, isempty := n.children[childIdx].(Empty)
+		if isempty {
+			// A question arises here: what if this proof of absence
+			// corresponds to several stems? Should the ext status be
+			// repeated as many times? It would be wasteful, so the
+			// decoding code has to be aware of this corner case.
+			esses = append(esses, extStatusAbsentEmpty|((n.depth+1)<<3))
+			for i := 0; i < len(group); i++ {
+				// Append one nil value per key in this missing stem
+				pe.Vals = append(pe.Vals, nil)
+			}
+			continue
+		}
+
+		pec, es, other, err := n.children[childIdx].GetProofItemsWithEpoch(group, resolver, epoch)
+		if err != nil {
+			// TODO: add a test case to cover this scenario.
+			return nil, nil, nil, err
+		}
+		pe.Merge(pec)
+		poass = append(poass, other...)
+		esses = append(esses, es...)
+	}
+
+	return pe, esses, poass, nil
+}
+
 // Serialize returns the serialized form of the internal node.
 // The format is: <nodeType><bitlist><commitment>
 func (n *InternalNode) Serialize() ([]byte, error) {
@@ -1738,6 +1842,159 @@ func (n *LeafNode) GetProofItems(keys keylist, _ NodeResolverFn) (*ProofElements
 				poass = append(poass, n.stem)
 			}
 			pe.Vals = append(pe.Vals, nil)
+			continue
+		}
+
+		// corner case (see previous corner case): if a proof-of-absence
+		// stem was found, and it now turns out the same stem is used as
+		// a proof of presence, clear the proof-of-absence list to avoid
+		// redundancy.
+		if len(poass) > 0 {
+			poass = nil
+			esses = nil
+		}
+
+		var (
+			suffix   = key[31]
+			suffPoly [NodeWidth]Fr // suffix-level polynomial
+			count    int
+			err      error
+		)
+		if suffix >= 128 {
+			count, err = fillSuffixTreePoly(suffPoly[:], n.values[128:])
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		} else {
+			count, err = fillSuffixTreePoly(suffPoly[:], n.values[:128])
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
+
+		// Proof of absence: case of a missing suffix tree.
+		//
+		// The suffix tree for this value is missing, i.e. all
+		// values in the extension-and-suffix tree are grouped
+		// in the other suffix tree (e.g. C2 if we are looking
+		// at C1).
+		if count == 0 {
+			// TODO(gballet) maintain a count variable at LeafNode level
+			// so that we know not to build the polynomials in this case,
+			// as all the information is available before fillSuffixTreePoly
+			// has to be called, save the count.
+			esses = append(esses, extStatusAbsentEmpty|(n.depth<<3))
+			pe.Vals = append(pe.Vals, nil)
+			continue
+		}
+
+		var scomm *Point
+		if suffix < 128 {
+			scomm = n.c1
+		} else {
+			scomm = n.c2
+		}
+		var leaves [2]Fr
+		if n.values[suffix] == nil {
+			// Proof of absence: case of a missing value.
+			//
+			// Suffix tree is present as a child of the extension,
+			// but does not contain the requested suffix. This can
+			// only happen when the leaf has never been written to
+			// since after deletion the value would be set to zero
+			// but still contain the leaf marker 2^128.
+			leaves[0], leaves[1] = FrZero, FrZero
+		} else {
+			// suffix tree is present and contains the key
+			leaves[0], leaves[1] = suffPoly[2*suffix], suffPoly[2*suffix+1]
+		}
+		pe.Cis = append(pe.Cis, scomm, scomm)
+		pe.Zis = append(pe.Zis, 2*suffix, 2*suffix+1)
+		pe.Yis = append(pe.Yis, &leaves[0], &leaves[1])
+		pe.Fis = append(pe.Fis, suffPoly[:], suffPoly[:])
+		pe.Vals = append(pe.Vals, n.values[key[31]])
+		if len(esses) == 0 || esses[len(esses)-1] != extStatusPresent|(n.depth<<3) {
+			esses = append(esses, extStatusPresent|(n.depth<<3))
+		}
+		slotPath := string(key[:n.depth]) + string([]byte{2 + suffix/128})
+		pe.ByPath[slotPath] = scomm
+	}
+
+	return pe, esses, poass, nil
+}
+
+func (n *LeafNode) GetProofItemsWithEpoch(keys keylist, _ NodeResolverFn, epoch StateEpoch) (*ProofElements, []byte, [][]byte, error) { // skipcq: GO-R1005
+
+	var (
+		poly [NodeWidth]Fr // top-level polynomial
+		pe                 = &ProofElements{
+			Cis:    []*Point{n.commitment, n.commitment},
+			Zis:    []byte{0, 1},
+			Yis:    []*Fr{&poly[0], &poly[1]}, // Should be 0
+			Fis:    [][]Fr{poly[:], poly[:]},
+			Vals:   make([][]byte, 0, len(keys)),
+			ByPath: map[string]*Point{},
+		}
+
+		esses []byte   = nil // list of extension statuses
+		poass [][]byte       // list of proof-of-absence stems
+	)
+
+	// Initialize the top-level polynomial with 1 + stem + C1 + C2
+	poly[0].SetUint64(1)
+	if err := StemFromBytes(&poly[1], n.stem); err != nil {
+		return nil, nil, nil, fmt.Errorf("error serializing stem '%x': %w", n.stem, err)
+	}
+	banderwagon.BatchMapToScalarField([]*Fr{&poly[2], &poly[3]}, []*Point{n.c1, n.c2})
+
+	// First pass: add top-level elements first
+	var hasC1, hasC2 bool
+	for _, key := range keys {
+		hasC1 = hasC1 || (key[31] < 128)
+		hasC2 = hasC2 || (key[31] >= 128)
+		if hasC2 {
+			break
+		}
+	}
+	if hasC1 {
+		pe.Cis = append(pe.Cis, n.commitment)
+		pe.Zis = append(pe.Zis, 2)
+		pe.Yis = append(pe.Yis, &poly[2])
+		pe.Fis = append(pe.Fis, poly[:])
+	}
+	if hasC2 {
+		pe.Cis = append(pe.Cis, n.commitment)
+		pe.Zis = append(pe.Zis, 3)
+		pe.Yis = append(pe.Yis, &poly[3])
+		pe.Fis = append(pe.Fis, poly[:])
+	}
+
+	// Second pass: add the cn-level elements
+	for _, key := range keys {
+
+		pe.ByPath[string(key[:n.depth])] = n.commitment
+
+		if EpochExpired(0, epoch) {
+			esses = append(esses, extStatusExpired|(n.depth<<3))
+			poass = append(poass, n.stem)
+			pe.Vals = append(pe.Vals, nil)
+			continue
+		}
+
+		// Proof of absence: case of a differing stem.
+		// Add an unopened stem-level node.
+		if !equalPaths(n.stem, key) {
+			// Corner case: don't add the poa stem if it's
+			// already present as a proof-of-absence for a
+			// different key, or for the same key (case of
+			// multiple missing keys being absent).
+			// The list of extension statuses has to be of
+			// length 1 at this level, so skip otherwise.
+			if len(esses) == 0 {
+				esses = append(esses, extStatusAbsentOther|(n.depth<<3))
+				poass = append(poass, n.stem)
+				pe.Vals = append(pe.Vals, nil)
+			}
 			continue
 		}
 
@@ -2389,6 +2646,166 @@ func (n *ExpiryLeafNode) GetProofItems(keys keylist, _ NodeResolverFn) (*ProofEl
 
 		cnEpoch := n.GetEpoch(suffix)
 		expired := EpochExpired(cnEpoch, n.currEpoch)
+		if expired {
+			esses = append(esses, extStatusExpired|(n.depth<<3))
+			poass = append(poass, n.stem)
+			pe.Vals = append(pe.Vals, nil)
+			continue
+		}
+
+		// Proof of absence: case of a differing stem.
+		// Add an unopened stem-level node.
+		if !equalPaths(n.stem, key) {
+			// Corner case: don't add the poa stem if it's
+			// already present as a proof-of-absence for a
+			// different key, or for the same key (case of
+			// multiple missing keys being absent).
+			// The list of extension statuses has to be of
+			// length 1 at this level, so skip otherwise.
+			if len(esses) == 0 {
+				esses = append(esses, extStatusAbsentOther|(n.depth<<3))
+				poass = append(poass, n.stem)
+				pe.Vals = append(pe.Vals, nil)
+			}
+			continue
+		}
+
+		// corner case (see previous corner case): if a proof-of-absence
+		// stem was found, and it now turns out the same stem is used as
+		// a proof of presence, clear the proof-of-absence list to avoid
+		// redundancy.
+		if len(poass) > 0 {
+			poass = nil
+			esses = nil
+		}
+
+		if suffix >= 128 {
+			count, err = fillSuffixTreePoly(suffPoly[:], n.values[128:])
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		} else {
+			count, err = fillSuffixTreePoly(suffPoly[:], n.values[:128])
+			if err != nil {
+				return nil, nil, nil, err
+			}
+		}
+
+		// Proof of absence: case of a missing suffix tree.
+		//
+		// The suffix tree for this value is missing, i.e. all
+		// values in the extension-and-suffix tree are grouped
+		// in the other suffix tree (e.g. C2 if we are looking
+		// at C1).
+		if count == 0 {
+			// TODO(gballet) maintain a count variable at LeafNode level
+			// so that we know not to build the polynomials in this case,
+			// as all the information is available before fillSuffixTreePoly
+			// has to be called, save the count.
+			esses = append(esses, extStatusAbsentEmpty|(n.depth<<3))
+			pe.Vals = append(pe.Vals, nil)
+			continue
+		}
+
+		var scomm *Point
+		if suffix < 128 {
+			scomm = n.c1
+		} else {
+			scomm = n.c2
+		}
+		var leaves [2]Fr
+		if n.values[suffix] == nil {
+			// Proof of absence: case of a missing value.
+			//
+			// Suffix tree is present as a child of the extension,
+			// but does not contain the requested suffix. This can
+			// only happen when the leaf has never been written to
+			// since after deletion the value would be set to zero
+			// but still contain the leaf marker 2^128.
+			leaves[0], leaves[1] = FrZero, FrZero
+		} else {
+			// suffix tree is present and contains the key
+			leaves[0], leaves[1] = suffPoly[2*suffix], suffPoly[2*suffix+1]
+		}
+		pe.Cis = append(pe.Cis, scomm, scomm)
+		pe.Zis = append(pe.Zis, 2*suffix, 2*suffix+1)
+		pe.Yis = append(pe.Yis, &leaves[0], &leaves[1])
+		pe.Fis = append(pe.Fis, suffPoly[:], suffPoly[:])
+		pe.Vals = append(pe.Vals, n.values[key[31]])
+		if len(esses) == 0 || esses[len(esses)-1] != extStatusPresent|(n.depth<<3) {
+			esses = append(esses, extStatusPresent|(n.depth<<3))
+		}
+		slotPath := string(key[:n.depth]) + string([]byte{2 + suffix/128})
+		pe.ByPath[slotPath] = scomm
+	}
+
+	return pe, esses, poass, nil
+}
+
+func (n *ExpiryLeafNode) GetProofItemsWithEpoch(keys keylist, _ NodeResolverFn, epoch StateEpoch) (*ProofElements, []byte, [][]byte, error) {
+	var (
+		poly [NodeWidth]Fr // top-level polynomial
+		pe                 = &ProofElements{
+			Cis:    []*Point{n.commitment, n.commitment},
+			Zis:    []byte{0, 1},              // 0 = 1, 1 = Stem, 2 = C1, 3 = C2, 4 = C3
+			Yis:    []*Fr{&poly[0], &poly[1]}, // Should be 0
+			Fis:    [][]Fr{poly[:], poly[:]},
+			Vals:   make([][]byte, 0, len(keys)),
+			ByPath: map[string]*Point{},
+		}
+
+		esses []byte   = nil // list of extension statuses
+		poass [][]byte       // list of proof-of-absence stems
+	)
+
+	// Initialize the top-level polynomial with 1 + stem + C1 + C2
+	poly[0].SetUint64(1)
+	if err := StemFromBytes(&poly[1], n.stem); err != nil {
+		return nil, nil, nil, err
+	}
+	banderwagon.BatchMapToScalarField([]*Fr{&poly[2], &poly[3], &poly[4]}, []*Point{n.c1, n.c2, n.c3})
+
+	// First pass: add top-level elements first
+	var hasC1, hasC2 bool
+	for _, key := range keys {
+		hasC1 = hasC1 || (key[31] < 128)
+		hasC2 = hasC2 || (key[31] >= 128)
+		if hasC2 {
+			break
+		}
+	}
+	if hasC1 {
+		pe.Cis = append(pe.Cis, n.commitment)
+		pe.Zis = append(pe.Zis, 2)
+		pe.Yis = append(pe.Yis, &poly[2])
+		pe.Fis = append(pe.Fis, poly[:])
+	}
+	if hasC2 {
+		pe.Cis = append(pe.Cis, n.commitment)
+		pe.Zis = append(pe.Zis, 3)
+		pe.Yis = append(pe.Yis, &poly[3])
+		pe.Fis = append(pe.Fis, poly[:])
+	}
+
+	// add C3
+	pe.Cis = append(pe.Cis, n.commitment)
+	pe.Zis = append(pe.Zis, 4)
+	pe.Yis = append(pe.Yis, &poly[4])
+	pe.Fis = append(pe.Fis, poly[:])
+
+	// Second pass: add the cn-level elements
+	for _, key := range keys {
+		var (
+			suffix   = key[31]
+			suffPoly [NodeWidth]Fr // suffix-level polynomial
+			count    int
+			err      error
+		)
+
+		pe.ByPath[string(key[:n.depth])] = n.commitment
+
+		cnEpoch := n.GetEpoch(suffix)
+		expired := EpochExpired(cnEpoch, epoch)
 		if expired {
 			esses = append(esses, extStatusExpired|(n.depth<<3))
 			poass = append(poass, n.stem)

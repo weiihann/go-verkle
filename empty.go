@@ -57,6 +57,10 @@ func (Empty) GetProofItems(keylist, NodeResolverFn) (*ProofElements, []byte, [][
 	return nil, nil, nil, errors.New("trying to produce a commitment for an empty subtree")
 }
 
+func (Empty) GetProofItemsWithEpoch(keys keylist, resolver NodeResolverFn, epoch StateEpoch) (*ProofElements, []byte, [][]byte, error) {
+	return nil, nil, nil, errors.New("trying to produce a commitment for an empty subtree")
+}
+
 func (Empty) Serialize() ([]byte, error) {
 	return nil, errors.New("can't encode empty node to RLP")
 }
