@@ -79,6 +79,12 @@ type StateDiff []StemStateDiff
 
 func GetCommitmentsForMultiproof(root VerkleNode, keys [][]byte, resolver NodeResolverFn) (*ProofElements, []byte, [][]byte, error) {
 	sort.Sort(keylist(keys))
+	if n, ok := root.(*InternalNode); ok {
+		if n.currEpoch == 0 {
+			return n.GetProofItems(keys, resolver)
+		}
+		return n.GetProofItemsWithEpoch(keys, resolver, n.currEpoch)
+	}
 	return root.GetProofItems(keylist(keys), resolver)
 }
 
@@ -362,6 +368,7 @@ type stemInfo struct {
 }
 
 // PreStateTreeFromProof builds a stateless prestate tree from the proof.
+// TODO(hw): add extStatusExpiry case
 func PreStateTreeFromProof(proof *Proof, rootC *Point) (VerkleNode, error) { // skipcq: GO-R1005
 	stems := make([][]byte, 0, len(proof.Keys))
 	for _, k := range proof.Keys {
