@@ -1041,6 +1041,9 @@ func TestProofVerifyTwoLeavesEpoch0Epoch2(t *testing.T) {
 	proof, cis, zis, yis, _ = MakeVerkleMultiProof(root, nil, [][]byte{zeroKeyTest, oneKeyTest, ffx32KeyTest}, nil)
 	if ok, err := VerifyVerkleProof(proof, cis, zis, yis, cfg); !ok || err != nil {
 		t.Fatalf("could not verify verkle proof: %s", ToDot(root))
+	}
+}
+
 func TestProofOfAbsenceBorderCase(t *testing.T) {
 	root := New()
 

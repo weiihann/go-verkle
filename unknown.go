@@ -78,3 +78,7 @@ func (UnknownNode) setDepth(_ byte) {
 func (UnknownNode) Hash() *Fr {
 	return &FrZero
 }
+
+func (UnknownNode) Revive([]byte, [][]byte, NodeResolverFn) error {
+	return errExpiredNodeNotFound
+}

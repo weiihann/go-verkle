@@ -2377,3 +2377,262 @@ func TestGetTwoLeavesLastLevelForkC2ExpiredEpoch1(t *testing.T) {
 		t.Fatalf("did not find correct epochs in trie, epoch0: expected %d got %d, epoch1: expected %d got %d", 2, leaf.epochs[0], 1, leaf.epochs[1])
 	}
 }
+
+func TestReviveEpoch0(t *testing.T) {
+	t.Parallel()
+
+	root := New()
+	root.Insert(zeroKeyTest, testValue, nil)
+	root.Insert(ffKeyTest, testValue, nil)
+
+	root.(*InternalNode).UpdateCurrEpoch(2)
+	_, ok := root.(*InternalNode).children[0].(*LeafNode)
+	if !ok {
+		t.Fatalf("invalid leaf node type %v", root.(*InternalNode).children[0])
+	}
+
+	_, err := root.Get(zeroKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	_, err = root.Get(ffKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	reviveStem := zeroKeyTest[:31]
+	reviveSuffixZero := zeroKeyTest[31]
+	reviveSuffixFF := ffKeyTest[31]
+	reviveValues := make([][]byte, NodeWidth)
+	reviveValues[reviveSuffixZero] = testValue
+	reviveValues[reviveSuffixFF] = testValue
+	err = root.(*InternalNode).Revive(reviveStem, reviveValues, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leaf, ok := root.(*InternalNode).children[0].(*ExpiryLeafNode)
+	if !ok {
+		t.Fatalf("invalid leaf node type %v", root.(*InternalNode).children[0])
+	}
+
+	val, err := root.Get(zeroKeyTest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(val, testValue) {
+		t.Fatalf("got a different value from the tree than expected %x != %x", val, testValue)
+	}
+
+	val, err = root.Get(ffKeyTest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(val, testValue) {
+		t.Fatalf("got a different value from the tree than expected %x != %x", val, testValue)
+	}
+
+	if leaf.currEpoch != 2 {
+		t.Fatalf("did not find correct epoch in trie %d != %d", 2, leaf.currEpoch)
+	}
+
+	if leaf.epochs[0] != 2 && leaf.epochs[1] != 2 {
+		t.Fatalf("did not find correct epochs in trie, epoch0: expected %d got %d, epoch1: expected %d got %d", 2, leaf.epochs[0], 0, leaf.epochs[1])
+	}
+}
+
+func TestRevivePartialEpoch0(t *testing.T) {
+	t.Parallel()
+
+	root := New()
+	root.Insert(zeroKeyTest, testValue, nil)
+	root.Insert(ffKeyTest, testValue, nil)
+
+	root.(*InternalNode).UpdateCurrEpoch(2)
+	_, ok := root.(*InternalNode).children[0].(*LeafNode)
+	if !ok {
+		t.Fatalf("invalid leaf node type %v", root.(*InternalNode).children[0])
+	}
+
+	_, err := root.Get(zeroKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	_, err = root.Get(ffKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	reviveStem := zeroKeyTest[:31]
+	reviveSuffixZero := zeroKeyTest[31]
+	reviveValues := make([][]byte, NodeWidth)
+	reviveValues[reviveSuffixZero] = testValue
+	err = root.(*InternalNode).Revive(reviveStem, reviveValues, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leaf, ok := root.(*InternalNode).children[0].(*ExpiryLeafNode)
+	if !ok {
+		t.Fatalf("invalid leaf node type %v", root.(*InternalNode).children[0])
+	}
+
+	val, err := root.Get(zeroKeyTest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(val, testValue) {
+		t.Fatalf("got a different value from the tree than expected %x != %x", val, testValue)
+	}
+
+	_, err = root.Get(ffKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	if leaf.currEpoch != 2 {
+		t.Fatalf("did not find correct epoch in trie %d != %d", 2, leaf.currEpoch)
+	}
+
+	if leaf.epochs[0] != 2 && leaf.epochs[1] != 0 {
+		t.Fatalf("did not find correct epochs in trie, epoch0: expected %d got %d, epoch1: expected %d got %d", 2, leaf.epochs[0], 0, leaf.epochs[1])
+	}
+}
+
+func TestReviveEpoch1(t *testing.T) {
+	t.Parallel()
+
+	root := New()
+	root.(*InternalNode).UpdateCurrEpoch(1)
+	root.Insert(zeroKeyTest, testValue, nil)
+	root.Insert(ffKeyTest, testValue, nil)
+
+	root.(*InternalNode).UpdateCurrEpoch(3)
+	leaf, ok := root.(*InternalNode).children[0].(*ExpiryLeafNode)
+	if !ok {
+		t.Fatalf("invalid leaf node type %v", root.(*InternalNode).children[0])
+	}
+
+	_, err := root.Get(zeroKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	_, err = root.Get(ffKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	reviveStem := zeroKeyTest[:31]
+	reviveSuffixZero := zeroKeyTest[31]
+	reviveSuffixFF := ffKeyTest[31]
+	reviveValues := make([][]byte, NodeWidth)
+	reviveValues[reviveSuffixZero] = testValue
+	reviveValues[reviveSuffixFF] = testValue
+	err = root.(*InternalNode).Revive(reviveStem, reviveValues, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	val, err := root.Get(zeroKeyTest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(val, testValue) {
+		t.Fatalf("got a different value from the tree than expected %x != %x", val, testValue)
+	}
+
+	val, err = root.Get(ffKeyTest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(val, testValue) {
+		t.Fatalf("got a different value from the tree than expected %x != %x", val, testValue)
+	}
+
+	if leaf.currEpoch != 3 {
+		t.Fatalf("did not find correct epoch in trie %d != %d", 2, leaf.currEpoch)
+	}
+
+	if leaf.epochs[0] != 3 && leaf.epochs[1] != 3 {
+		t.Fatalf("did not find correct epochs in trie, epoch0: expected %d got %d, epoch1: expected %d got %d", 2, leaf.epochs[0], 0, leaf.epochs[1])
+	}
+}
+
+func TestRevivePartialEpoch1(t *testing.T) {
+	t.Parallel()
+
+	root := New()
+	root.(*InternalNode).UpdateCurrEpoch(1)
+	root.Insert(zeroKeyTest, testValue, nil)
+	root.Insert(ffKeyTest, testValue, nil)
+
+	root.(*InternalNode).UpdateCurrEpoch(3)
+	_, ok := root.(*InternalNode).children[0].(*ExpiryLeafNode)
+	if !ok {
+		t.Fatalf("invalid leaf node type %v", root.(*InternalNode).children[0])
+	}
+
+	_, err := root.Get(zeroKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	_, err = root.Get(ffKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	reviveStem := zeroKeyTest[:31]
+	reviveSuffixZero := zeroKeyTest[31]
+	reviveValues := make([][]byte, NodeWidth)
+	reviveValues[reviveSuffixZero] = testValue
+	err = root.(*InternalNode).Revive(reviveStem, reviveValues, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leaf, ok := root.(*InternalNode).children[0].(*ExpiryLeafNode)
+	if !ok {
+		t.Fatalf("invalid leaf node type %v", root.(*InternalNode).children[0])
+	}
+
+	val, err := root.Get(zeroKeyTest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(val, testValue) {
+		t.Fatalf("got a different value from the tree than expected %x != %x", val, testValue)
+	}
+
+	_, err = root.Get(ffKeyTest, nil)
+	if err == nil {
+		t.Fatalf("expected error accessing expired value")
+	}
+
+	if leaf.currEpoch != 3 {
+		t.Fatalf("did not find correct epoch in trie %d != %d", 2, leaf.currEpoch)
+	}
+
+	if leaf.epochs[0] != 3 && leaf.epochs[1] != 1 {
+		t.Fatalf("did not find correct epochs in trie, epoch0: expected %d got %d, epoch1: expected %d got %d", 2, leaf.epochs[0], 0, leaf.epochs[1])
+	}
+}
+
+// TODO(w)
+func TestReviveMultipleLeavesEpoch0(t *testing.T) {
+
+}
+
+// TODO(w)
+func TestReviveMultipleLeavesEpoch1(t *testing.T) {
+
+}

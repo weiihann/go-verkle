@@ -88,6 +88,10 @@ func (HashedNode) Hash() *Fr {
 	panic("can not hash a hashed node")
 }
 
+func (HashedNode) Revive([]byte, [][]byte, NodeResolverFn) error {
+	return errExpiredNodeNotFound
+}
+
 func (n *ExpiryHashedNode) Insert([]byte, []byte, NodeResolverFn) error {
 	return errInsertIntoHash
 }
@@ -122,6 +126,10 @@ func (n *ExpiryHashedNode) GetEpoch() StateEpoch {
 
 func (n *ExpiryHashedNode) UpdateEpoch(epoch StateEpoch) {
 	n.epoch = epoch
+}
+
+func (n *ExpiryHashedNode) Revive([]byte, [][]byte, NodeResolverFn) error {
+	return errExpiredNodeNotFound
 }
 
 // The format is: <nodeType><stem><commitment><epoch>
