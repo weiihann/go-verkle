@@ -80,3 +80,7 @@ func (Empty) setDepth(_ byte) {
 func (Empty) Hash() *Fr {
 	return &FrZero
 }
+
+func (Empty) Revive([]byte, [][]byte, NodeResolverFn) error {
+	return errExpiredNodeNotFound
+}

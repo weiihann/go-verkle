@@ -87,6 +87,8 @@ type VerkleNode interface {
 	// Serialize encodes the node to RLP.
 	Serialize() ([]byte, error)
 
+	Revive([]byte, [][]byte, NodeResolverFn) error
+
 	// Copy a node and its children
 	Copy() VerkleNode
 
@@ -1023,6 +1025,94 @@ func (n *InternalNode) Commit() *Point {
 	return n.commitment
 }
 
+// TODO(asyukii)
+func (n *InternalNode) Revive(stem []byte, values [][]byte, resolver NodeResolverFn) error {
+	nChild := offset2key(stem, n.depth) // index of the child pointed by the next byte in the key
+
+	switch child := n.children[nChild].(type) {
+	case UnknownNode, Empty:
+		return errExpiredNodeNotFound
+	case HashedNode, *ExpiryHashedNode:
+		if resolver == nil {
+			return fmt.Errorf("resolver is nil")
+		}
+		serialized, err := resolver(stem[:n.depth+1])
+		if err != nil {
+			return fmt.Errorf("verkle tree: error resolving node %x at depth %d: %w", stem, n.depth, err)
+		}
+		resolved, err := ParseNode(serialized, n.depth+1)
+		if err != nil {
+			return fmt.Errorf("verkle tree: error parsing resolved node %x: %w", stem, err)
+		}
+
+		n.children[nChild] = resolved
+		n.cowChild(nChild)
+
+		return n.Revive(stem, values, resolver)
+	case *LeafNode:
+		var (
+			revC1   bool
+			revC2   bool
+			c1Epoch = StateEpoch0
+			c2Epoch = StateEpoch0
+		)
+
+		n.cowChild(nChild)
+		if !EpochExpired(StateEpoch0, n.currEpoch) {
+			return fmt.Errorf("cannot revive leaf node that is not expired")
+		}
+
+		for i := 0; i < NodeWidth/2; i++ {
+			if values[i] != nil {
+				revC1 = true
+				c1Epoch = n.currEpoch
+				break
+			}
+		}
+
+		for i := NodeWidth / 2; i < NodeWidth; i++ {
+			if values[i] != nil {
+				revC2 = true
+				c2Epoch = n.currEpoch
+				break
+			}
+		}
+
+		tempLeaf, err := NewLeafNode(stem, values)
+		if err != nil {
+			return err
+		}
+
+		if revC1 && !child.c1.Equal(tempLeaf.c1) {
+			return fmt.Errorf("revive failed: c1 does not match")
+		}
+
+		if revC2 && !child.c2.Equal(tempLeaf.c2) {
+			return fmt.Errorf("revive failed: c2 does not match")
+		}
+
+		newLeaf, err := NewExpiryLeafNode(stem, values, n.currEpoch, c1Epoch, c2Epoch)
+		if err != nil {
+			return err
+		}
+
+		n.children[nChild] = newLeaf
+		return nil
+
+	case *ExpiryLeafNode:
+		n.cowChild(nChild)
+		child.updateCurrEpoch(n.currEpoch)
+		err := child.Revive(stem, values, resolver)
+		return err
+	case *InternalNode:
+		n.cowChild(nChild)
+		child.UpdateCurrEpoch(n.currEpoch)
+		return child.Revive(stem, values, resolver)
+	default: // It should be an UnknownNode.
+		return errUnknownNodeType
+	}
+}
+
 func commitNodesAtLevel(nodes []*InternalNode) {
 	points := make([]*Point, 0, 1024)
 	cowIndexes := make([]int, 0, 1024)
@@ -1351,6 +1441,8 @@ func (n *InternalNode) Copy() VerkleNode {
 			ret.cow[k].Set(v)
 		}
 	}
+
+	ret.currEpoch = n.currEpoch
 
 	return ret
 }
@@ -2116,6 +2208,10 @@ func (n *LeafNode) setDepth(d byte) {
 
 func (n *LeafNode) Values() [][]byte {
 	return n.values
+}
+
+func (n *LeafNode) Revive([]byte, [][]byte, NodeResolverFn) error {
+	return errExpiredNodeNotFound
 }
 
 func (n *ExpiryLeafNode) Insert(key []byte, value []byte, _ NodeResolverFn) error {
@@ -2912,6 +3008,7 @@ func (n *ExpiryLeafNode) Copy() VerkleNode {
 		l.c3 = new(Point)
 		l.c3.Set(n.c3)
 	}
+	l.currEpoch = n.currEpoch
 
 	return l
 }
@@ -2968,6 +3065,126 @@ func (n *ExpiryLeafNode) updateCurrEpoch(epoch StateEpoch) {
 func (n *ExpiryLeafNode) GetEpoch(index byte) StateEpoch {
 	ind := ResolveIndex(index)
 	return n.epochs[ind]
+}
+
+func (n *ExpiryLeafNode) Revive(stem []byte, values [][]byte, _ NodeResolverFn) error {
+
+	newNode := n.Copy().(*ExpiryLeafNode)
+	revC1, revC2, err := newNode.reviveMultipleLeaves(values)
+	if err != nil {
+		return fmt.Errorf("revive failed: %v", err)
+	}
+
+	// Check if the commitment of the copy is the same as the original
+	if !n.Commitment().Equal(newNode.Commitment()) {
+		return fmt.Errorf("revive failed: commitments do not match")
+	}
+
+	if revC1 {
+		copy(n.values[:NodeWidth/2], values[:NodeWidth/2])
+		n.UpdateEpoch(0, n.currEpoch, false)
+	}
+
+	if revC2 {
+		copy(n.values[NodeWidth/2:], values[NodeWidth/2:])
+		n.UpdateEpoch(NodeWidth/2, n.currEpoch, false)
+	}
+
+	return nil
+}
+
+func (n *ExpiryLeafNode) reviveMultipleLeaves(values [][]byte) (bool, bool, error) {
+	var oldC1, oldC2, oldC3 *Point
+	var revC1, revC2 bool
+
+	c1Expired := EpochExpired(n.epochs[0], n.currEpoch)
+	c2Expired := EpochExpired(n.epochs[1], n.currEpoch)
+
+	for i, v := range values {
+		if len(v) != 0 {
+			if !c1Expired && i < NodeWidth/2 {
+				return false, false, fmt.Errorf("attempting to revive C1 that is not expired")
+			} else if !c2Expired && i >= NodeWidth/2 {
+				return false, false, fmt.Errorf("attempting to revive C2 that is not expired")
+			}
+
+			if i < NodeWidth/2 {
+				// First time we touch C1? Save the original point for later.
+				if oldC1 == nil {
+					oldC1 = &Point{}
+					oldC1.Set(n.c1)
+				}
+				// We update C1 directly in `n`. We have our original copy in oldC1.
+				if err := n.updateCn(byte(i), v, n.c1); err != nil {
+					return false, false, err
+				}
+				revC1 = true
+			} else {
+				// First time we touch C2? Save the original point for later.
+				if oldC2 == nil {
+					oldC2 = &Point{}
+					oldC2.Set(n.c2)
+				}
+				// We update C2 directly in `n`. We have our original copy in oldC2.
+				if err := n.updateCn(byte(i), v, n.c2); err != nil {
+					return false, false, err
+				}
+				revC2 = true
+			}
+			n.values[i] = v
+
+			if oldC3 == nil {
+				oldC3 = &Point{}
+				oldC3.Set(n.c3)
+			}
+		}
+	}
+
+	// We have three potential cases here:
+	// 1. We have touched C1 and C2: we Fr-batch old1, old2 and newC1, newC2. (4x gain ratio)
+	// 2. We have touched only one CX: we Fr-batch oldX and newCX. (2x gain ratio)
+	// 3. No C1 or C2 was touched, this is a noop.
+	var frs [4]Fr
+	const c1Idx = 2 // [1, stem, ->C1<-, C2]
+	const c2Idx = 3 // [1, stem, C1, ->C2<-]
+	const c3Idx = 4 // [1, stem, C1, C2, ->C3<-]
+
+	// No values updated
+	if oldC1 == nil && oldC2 == nil {
+		return revC1, revC2, nil
+	}
+
+	if oldC1 != nil && oldC2 != nil { // Case 1.
+		banderwagon.BatchMapToScalarField([]*Fr{&frs[0], &frs[1], &frs[2], &frs[3]}, []*Point{n.c1, oldC1, n.c2, oldC2})
+		n.updateC(c1Idx, frs[0], frs[1])
+		n.updateC(c2Idx, frs[2], frs[3])
+	} else if oldC1 != nil { // Case 2. (C1 touched)
+		banderwagon.BatchMapToScalarField([]*Fr{&frs[0], &frs[1]}, []*Point{n.c1, oldC1})
+		n.updateC(c1Idx, frs[0], frs[1])
+	} else if oldC2 != nil { // Case 2. (C2 touched)
+		banderwagon.BatchMapToScalarField([]*Fr{&frs[0], &frs[1]}, []*Point{n.c2, oldC2})
+		n.updateC(c2Idx, frs[0], frs[1])
+	}
+
+	var frsEpoch [2]Fr
+	banderwagon.BatchMapToScalarField([]*Fr{&frsEpoch[0], &frsEpoch[1]}, []*Point{n.c3, oldC3})
+	n.updateC(c3Idx, frsEpoch[0], frsEpoch[1])
+
+	return revC1, revC2, nil
+}
+
+func (n *ExpiryLeafNode) removeExpiredValues() {
+	if EpochExpired(n.epochs[0], n.currEpoch) {
+		for i := 0; i < NodeWidth/2; i++ {
+			n.values[i] = nil
+		}
+	}
+
+	if EpochExpired(n.epochs[1], n.currEpoch) {
+		for i := NodeWidth / 2; i < NodeWidth; i++ {
+			n.values[i] = nil
+		}
+	}
 }
 
 // Function used to resolve index to 0 or 1
