@@ -96,6 +96,7 @@ type VerkleNode interface {
 	toDot(string, string) string
 
 	setDepth(depth byte)
+	UpdateCurrEpoch(epoch StateEpoch)
 }
 
 // ProofElements gathers the elements needed to build a proof.
@@ -592,7 +593,7 @@ func (n *InternalNode) InsertStemWithEpoch(stem []byte, suffix byte, values [][]
 		if EpochExpired(childEpoch, epoch) {
 			return errExpiredValue
 		}
-		child.updateCurrEpoch(epoch)
+		child.UpdateCurrEpoch(epoch)
 
 		n.cowChild(nChild)
 		if equalPaths(child.stem, stem) {
@@ -797,7 +798,7 @@ func (n *InternalNode) GetStemWithEpoch(stem []byte, suffix byte, resolver NodeR
 
 		if equalPaths(child.stem, stem) {
 			child.UpdateEpoch(suffix, epoch, false)
-			child.updateCurrEpoch(epoch)
+			child.UpdateCurrEpoch(epoch)
 			return child.values, nil
 		}
 		return nil, nil
@@ -1110,7 +1111,7 @@ func (n *InternalNode) Revive(stem []byte, values [][]byte, resolver NodeResolve
 
 	case *ExpiryLeafNode:
 		n.cowChild(nChild)
-		child.updateCurrEpoch(n.currEpoch)
+		child.UpdateCurrEpoch(n.currEpoch)
 		err := child.Revive(stem, values, resolver)
 		return err
 	case *InternalNode:
@@ -1804,6 +1805,8 @@ func (n *LeafNode) Commitment() *Point {
 func (n *LeafNode) Commit() *Point {
 	return n.commitment
 }
+
+func (n *LeafNode) UpdateCurrEpoch(epoch StateEpoch) {}
 
 // fillSuffixTreePoly takes one of the two suffix tree and
 // builds the associated polynomial, to be used to compute
@@ -3095,7 +3098,7 @@ func (n *ExpiryLeafNode) UpdateEpoch(index byte, epoch StateEpoch, force bool) {
 	}
 }
 
-func (n *ExpiryLeafNode) updateCurrEpoch(epoch StateEpoch) {
+func (n *ExpiryLeafNode) UpdateCurrEpoch(epoch StateEpoch) {
 	n.currEpoch = epoch
 }
 

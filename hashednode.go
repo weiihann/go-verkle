@@ -40,6 +40,8 @@ type ExpiryHashedNode struct {
 	epoch      StateEpoch
 }
 
+func (HashedNode) UpdateCurrEpoch(epoch StateEpoch) {}
+
 func (HashedNode) Insert([]byte, []byte, NodeResolverFn) error {
 	return errInsertIntoHash
 }
@@ -91,6 +93,8 @@ func (HashedNode) Hash() *Fr {
 func (HashedNode) Revive([]byte, [][]byte, NodeResolverFn) error {
 	return errExpiredNodeNotFound
 }
+
+func (n *ExpiryHashedNode) UpdateCurrEpoch(epoch StateEpoch) {}
 
 func (n *ExpiryHashedNode) Insert([]byte, []byte, NodeResolverFn) error {
 	return errInsertIntoHash

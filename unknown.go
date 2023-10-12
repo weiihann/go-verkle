@@ -29,6 +29,8 @@ import "errors"
 
 type UnknownNode struct{}
 
+func (UnknownNode) UpdateCurrEpoch(epoch StateEpoch) {}
+
 func (UnknownNode) Insert([]byte, []byte, NodeResolverFn) error {
 	return errMissingNodeInStateless
 }
